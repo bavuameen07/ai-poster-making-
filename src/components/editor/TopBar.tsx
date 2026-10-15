@@ -18,12 +18,16 @@ import {
   Loader2,
   AlertCircle,
   Cloud,
+  Save,
+  RotateCcw,
 } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { IconButton } from "@/components/ui/IconButton";
+import { Modal } from "@/components/ui/Modal";
 import { useEditorStore } from "@/store/editorStore";
 import { getEngine } from "@/lib/editor/engineRef";
-import { exportPDF, exportPNG } from "@/lib/export";
+import { exportPDF, exportImageAs } from "@/lib/export";
+import { useProjectsStore } from "@/store/projectsStore";
 import { cn } from "@/lib/utils";
 
 const STATUS: Record<string, { label: string; icon: React.ReactNode; tone: string }> = {
@@ -45,12 +49,16 @@ export function TopBar({ onToggleLeft, onToggleRight }: TopBarProps) {
   const canUndo = useEditorStore((s) => s.canUndo);
   const canRedo = useEditorStore((s) => s.canRedo);
   const saveStatus = useEditorStore((s) => s.saveStatus);
+  const lastSavedAt = useEditorStore((s) => s.lastSavedAt);
   const exporting = useEditorStore((s) => s.exporting);
   const setExporting = useEditorStore((s) => s.setExporting);
   const setLastError = useEditorStore((s) => s.setLastError);
+  const refreshProjects = useProjectsStore((s) => s.refresh);
 
   const [menuOpen, setMenuOpen] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
+  const [jpegQuality, setJpegQuality] = useState(0.92);
+  const [resetOpen, setResetOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -64,19 +72,33 @@ export function TopBar({ onToggleLeft, onToggleRight }: TopBarProps) {
 
   const status = STATUS[saveStatus] ?? STATUS.idle;
 
-  const runExport = async (kind: "png" | "pdf", scale: number) => {
+  const runExport = async (kind: "png" | "jpeg" | "pdf", scale: number) => {
     setMenuOpen(false);
     setBusy(`${kind}-${scale}`);
     setExporting(true);
     try {
-      if (kind === "png") await exportPNG({ scale });
-      else await exportPDF({ scale });
+      if (kind === "pdf") await exportPDF({ scale });
+      else await exportImageAs(kind, { scale, quality: jpegQuality });
     } catch (error) {
       setLastError(error instanceof Error ? error.message : "Export failed. Please try again.");
     } finally {
       setExporting(false);
       setBusy(null);
     }
+  };
+
+  const saveNow = () => {
+    const engine = getEngine();
+    if (!engine) return;
+    engine.commit();
+    engine.persistNow();
+    void refreshProjects();
+  };
+
+  const confirmReset = () => {
+    getEngine()?.resetCanvas();
+    setResetOpen(false);
+    void refreshProjects();
   };
 
   const changeZoom = (delta: number) => {
@@ -108,12 +130,24 @@ export function TopBar({ onToggleLeft, onToggleRight }: TopBarProps) {
         />
       </label>
 
-      <span className={cn("hidden items-center gap-1.5 text-xs font-medium sm:inline-flex", status.tone)}>
+      <span
+        title={lastSavedAt ? `Last saved ${new Date(lastSavedAt).toLocaleTimeString()}` : undefined}
+        className={cn("hidden items-center gap-1.5 text-xs font-medium sm:inline-flex", status.tone)}
+      >
         {status.icon}
         {status.label}
       </span>
 
       <div className="ml-auto flex items-center gap-1">
+        <IconButton label="Save now" onClick={saveNow}>
+          <Save className="h-4 w-4" />
+        </IconButton>
+        <IconButton label="Reset canvas" onClick={() => setResetOpen(true)}>
+          <RotateCcw className="h-4 w-4" />
+        </IconButton>
+
+        <div className="mx-1 hidden h-6 w-px bg-line sm:block" />
+
         <IconButton label="Undo" onClick={() => getEngine()?.undo()} disabled={!canUndo}>
           <Undo2 className="h-4 w-4" />
         </IconButton>
@@ -154,9 +188,9 @@ export function TopBar({ onToggleLeft, onToggleRight }: TopBarProps) {
           </Button>
 
           {menuOpen && (
-            <div className="absolute right-0 top-full z-50 mt-2 w-56 animate-fade-in overflow-hidden rounded-panel border border-line bg-panel shadow-pop">
+            <div className="absolute right-0 top-full z-50 mt-2 w-60 animate-fade-in overflow-hidden rounded-panel border border-line bg-panel shadow-pop">
               <div className="px-3 py-2">
-                <p className="field-label">PNG</p>
+                <p className="field-label">PNG · transparent-friendly</p>
               </div>
               <div className="pb-1">
                 {[1, 2, 3].map((scale) => (
@@ -172,6 +206,46 @@ export function TopBar({ onToggleLeft, onToggleRight }: TopBarProps) {
                   </button>
                 ))}
               </div>
+
+              <div className="border-t border-line px-3 py-2">
+                <p className="field-label">JPEG</p>
+              </div>
+              <div className="flex items-center gap-1 px-3 pb-2">
+                {[
+                  { label: "Standard", value: 0.82 },
+                  { label: "High", value: 0.92 },
+                  { label: "Max", value: 1 },
+                ].map((option) => (
+                  <button
+                    key={option.label}
+                    type="button"
+                    onClick={() => setJpegQuality(option.value)}
+                    className={cn(
+                      "flex-1 rounded-md border px-1.5 py-1 text-[11px] font-medium transition-colors",
+                      jpegQuality === option.value
+                        ? "border-accent/50 bg-accent-wash text-accent"
+                        : "border-line bg-paper text-ink-soft hover:text-ink",
+                    )}
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </div>
+              <div className="pb-1">
+                {[1, 2, 3].map((scale) => (
+                  <button
+                    key={`jpeg-${scale}`}
+                    type="button"
+                    onClick={() => runExport("jpeg", scale)}
+                    className="flex w-full items-center gap-2.5 px-3 py-2 text-left text-sm text-ink transition-colors hover:bg-paper"
+                  >
+                    <FileImage className="h-4 w-4 text-ink-mute" />
+                    JPEG · {scale}×
+                    {busy === `jpeg-${scale}` && <Loader2 className="ml-auto h-3.5 w-3.5 animate-spin" />}
+                  </button>
+                ))}
+              </div>
+
               <div className="border-t border-line px-3 py-2">
                 <p className="field-label">PDF (print)</p>
               </div>
@@ -193,6 +267,27 @@ export function TopBar({ onToggleLeft, onToggleRight }: TopBarProps) {
           )}
         </div>
       </div>
+
+      <Modal
+        open={resetOpen}
+        onClose={() => setResetOpen(false)}
+        title="Reset canvas?"
+        footer={
+          <>
+            <Button variant="secondary" size="sm" onClick={() => setResetOpen(false)}>
+              Cancel
+            </Button>
+            <Button variant="danger" size="sm" onClick={confirmReset}>
+              Reset
+            </Button>
+          </>
+        }
+      >
+        <p className="text-sm text-ink-soft">
+          This clears every layer and the background image from “{name}”, keeping its size and
+          name. This cannot be undone.
+        </p>
+      </Modal>
     </header>
   );
 }

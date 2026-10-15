@@ -35,6 +35,16 @@ export function EditorShell({ initialTemplateId }: EditorShellProps) {
     const onKeyDown = (event: KeyboardEvent) => {
       const engine = getEngine();
       const mod = event.ctrlKey || event.metaKey;
+
+      if (mod && event.key.toLowerCase() === "s") {
+        event.preventDefault();
+        if (engine) {
+          engine.commit();
+          engine.persistNow();
+        }
+        return;
+      }
+
       if (isTypingTarget(event.target)) return;
       if (!engine) return;
 

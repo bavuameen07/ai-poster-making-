@@ -1,11 +1,14 @@
 import * as fabric from "fabric";
 import type {
+  BackgroundImageInfo,
+  ImageFit,
   LayerMeta,
   PersistedProject,
   PosterBackground,
   PosterDoc,
   PosterTemplate,
   PosterTextObject,
+  StoredProject,
   TextAlign,
 } from "@/types/poster";
 import type { SelectedObjectProps } from "@/store/editorStore";
@@ -13,6 +16,7 @@ import { useEditorStore } from "@/store/editorStore";
 import { clamp, debounce, round, uid } from "@/lib/utils";
 import { loadFont, nearestWeight, preloadAllFonts } from "@/lib/fonts";
 import { TEMPLATES } from "@/lib/templates";
+import { deleteProject, getProject, listProjects, putProject } from "@/lib/storage/db";
 
 type PosterTextbox = fabric.Textbox & {
   id: string;
@@ -20,14 +24,32 @@ type PosterTextbox = fabric.Textbox & {
   locked: boolean;
 };
 
-const EXTRA_PROPS = ["id", "posterName", "locked"];
+type PosterImage = fabric.FabricImage & {
+  id?: string;
+  posterName?: string;
+  role?: string;
+  fit?: ImageFit;
+  baseScale?: number;
+};
+
+const EXTRA_PROPS = ["id", "posterName", "locked", "role", "fit", "baseScale"];
 export const STORAGE_KEY = "ai-typography-poster:project:v1";
 const HISTORY_LIMIT = 60;
 const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 2;
+const THUMB_MAX = 260;
+const THUMB_INTERVAL = 4000;
+const ALLOWED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/webp"];
+const MAX_IMAGE_BYTES = 15 * 1024 * 1024;
 
 export interface TextPreset extends Partial<PosterTextObject> {
   text: string;
+}
+
+export interface ExportRenderOptions {
+  multiplier?: number;
+  format?: "png" | "jpeg";
+  quality?: number;
 }
 
 function createShadow(shadow: NonNullable<PosterTextObject["shadow"]>): fabric.Shadow {
@@ -72,6 +94,10 @@ export class CanvasEngine {
   private mounted = false;
   private counter = 0;
   private viewport = { width: 900, height: 700 };
+  private bgImage: PosterImage | null = null;
+  private projectCreatedAt = Date.now();
+  private lastThumbnail: string | null = null;
+  private lastThumbAt = 0;
 
   private store() {
     return useEditorStore.getState();
@@ -114,20 +140,25 @@ export class CanvasEngine {
       this.applyDocToCanvas();
     }
 
+    await this.restoreBackgroundImageFromCanvas();
     this.applyBackground(this.store().doc.background, false);
+    this.applyDimensions();
     this.syncAll();
     this.setBaseline();
     this.store().setHydrated(true);
+    this.store().setActiveProjectName(this.store().doc.name);
     if (requested) this.persistNow();
   }
 
   dispose(): void {
     this.commitSoon.cancel();
+    this.persistDebounced.cancel();
     if (this.canvas) {
       this.canvas.off();
       void this.canvas.dispose();
       this.canvas = null;
     }
+    this.bgImage = null;
     this.mounted = false;
   }
 
@@ -157,7 +188,8 @@ export class CanvasEngine {
     canvas.on("object:rotating", () => this.syncSelected());
 
     canvas.on("object:modified", (e) => {
-      if (this.suspend > 0 || this.suppressCommit) return;
+      if (this.suppressCommit) return;
+      if (this.suspend > 0) return;
       this.normalizeScaledText(e.target);
       this.canvas?.requestRenderAll();
       this.syncAll();
@@ -259,6 +291,212 @@ export class CanvasEngine {
     }
   }
 
+  // ----- background image -----
+
+  private findBackgroundImage(): PosterImage | null {
+    if (!this.canvas) return null;
+    const found = this.canvas.getObjects().find((o) => (o as PosterImage).role === "background");
+    return (found as PosterImage | undefined) ?? null;
+  }
+
+  private async restoreBackgroundImageFromCanvas(): Promise<void> {
+    const img = this.findBackgroundImage();
+    this.bgImage = img;
+    if (img) {
+      img.set({ selectable: false, evented: false, hoverCursor: "default" });
+      this.updateBackgroundImageClip();
+    }
+    this.syncBackgroundImage();
+  }
+
+  private addToBottom(obj: fabric.Object): void {
+    if (!this.canvas) return;
+    const objects = (this.canvas as unknown as { _objects: fabric.Object[] })._objects;
+    const index = objects.indexOf(obj);
+    if (index >= 0) objects.splice(index, 1);
+    objects.unshift(obj);
+    this.canvas.requestRenderAll();
+  }
+
+  private updateBackgroundImageClip(): void {
+    const img = this.bgImage;
+    if (!img) return;
+    const doc = this.store().doc;
+    const rect = new fabric.Rect({
+      width: doc.width,
+      height: doc.height,
+      left: 0,
+      top: 0,
+      originX: "left",
+      originY: "top",
+      absolutePositioned: true,
+    } as never);
+    img.clipPath = rect as never;
+    img.dirty = true;
+  }
+
+  private placeBackgroundImage(fit: ImageFit, zoom: number, offsetX: number, offsetY: number): void {
+    const img = this.bgImage;
+    if (!img || !this.canvas) return;
+    const doc = this.store().doc;
+    const natW = img.width || 1;
+    const natH = img.height || 1;
+    let base = img.baseScale ?? 1;
+    if (fit === "cover") base = Math.max(doc.width / natW, doc.height / natH);
+    else if (fit === "contain") base = Math.min(doc.width / natW, doc.height / natH);
+    else if (fit === "stretch") base = doc.width / natW;
+    img.baseScale = base;
+    img.fit = fit;
+    if (fit === "stretch") {
+      img.set({ scaleX: doc.width / natW, scaleY: doc.height / natH });
+    } else {
+      img.set({ scaleX: base * zoom, scaleY: base * zoom });
+    }
+    img.set({
+      left: doc.width / 2 + (offsetX / 100) * doc.width,
+      top: doc.height / 2 + (offsetY / 100) * doc.height,
+      originX: "center",
+      originY: "center",
+    });
+    img.setCoords();
+    img.dirty = true;
+  }
+
+  private readFileAsDataURL(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = () => reject(reader.error ?? new Error("Could not read the image file."));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async setBackgroundImage(file: File): Promise<void> {
+    if (!this.canvas) throw new Error("The editor canvas is not ready yet.");
+    if (!ALLOWED_IMAGE_TYPES.includes(file.type)) {
+      throw new Error("Unsupported image type. Please upload a JPG, PNG or WebP file.");
+    }
+    if (file.size > MAX_IMAGE_BYTES) {
+      throw new Error("That image is too large. Please use a file under 15 MB.");
+    }
+    const dataUrl = await this.readFileAsDataURL(file);
+    await this.applyBackgroundImageDataUrl(dataUrl, file.name);
+  }
+
+  async applyBackgroundImageDataUrl(dataUrl: string, name: string): Promise<void> {
+    if (!this.canvas) return;
+    let img: PosterImage;
+    try {
+      img = (await fabric.FabricImage.fromURL(dataUrl, { crossOrigin: "anonymous" })) as PosterImage;
+    } catch {
+      throw new Error("Could not load that image. It may be corrupt or unsupported.");
+    }
+    this.suspend += 1;
+    if (this.bgImage) this.canvas.remove(this.bgImage);
+    img.role = "background";
+    img.posterName = name || "Background image";
+    img.set({
+      selectable: false,
+      evented: false,
+      hoverCursor: "default",
+      originX: "center",
+      originY: "center",
+      opacity: 1,
+    });
+    img.baseScale = 1;
+    img.fit = "cover";
+    this.bgImage = img;
+    this.canvas.add(img);
+    this.addToBottom(img);
+    this.updateBackgroundImageClip();
+    this.placeBackgroundImage("cover", 1, 0, 0);
+    this.suspend -= 1;
+    this.canvas.requestRenderAll();
+    this.syncAll();
+    this.scheduleSave();
+  }
+
+  setBackgroundImageFit(fit: ImageFit): void {
+    if (!this.bgImage) return;
+    this.placeBackgroundImage(fit, 1, 0, 0);
+    this.canvas?.requestRenderAll();
+    this.syncBackgroundImage();
+    this.scheduleSave();
+  }
+
+  setBackgroundImageZoom(zoom: number): void {
+    const img = this.bgImage;
+    if (!img || !this.canvas) return;
+    const base = img.baseScale ?? 1;
+    const next = base * clamp(zoom, 0.2, 4);
+    img.set({ scaleX: next, scaleY: next, fit: img.fit === "stretch" ? "custom" : img.fit });
+    img.setCoords();
+    img.dirty = true;
+    this.canvas.requestRenderAll();
+    this.syncBackgroundImage();
+    this.scheduleSave();
+  }
+
+  setBackgroundImageOffset(offsetX: number, offsetY: number): void {
+    const img = this.bgImage;
+    if (!img || !this.canvas) return;
+    const doc = this.store().doc;
+    img.set({
+      left: doc.width / 2 + (offsetX / 100) * doc.width,
+      top: doc.height / 2 + (offsetY / 100) * doc.height,
+    });
+    img.setCoords();
+    this.canvas.requestRenderAll();
+    this.syncBackgroundImage();
+    this.scheduleSave();
+  }
+
+  setBackgroundImageOpacity(opacity: number): void {
+    const img = this.bgImage;
+    if (!img || !this.canvas) return;
+    img.set({ opacity: clamp(opacity, 0.05, 1) });
+    this.canvas.requestRenderAll();
+    this.syncBackgroundImage();
+    this.scheduleSave();
+  }
+
+  removeBackgroundImage(): void {
+    if (!this.bgImage || !this.canvas) return;
+    this.canvas.remove(this.bgImage);
+    this.bgImage = null;
+    this.canvas.requestRenderAll();
+    this.syncAll();
+    this.scheduleSave();
+  }
+
+  hasBackgroundImage(): boolean {
+    return Boolean(this.bgImage);
+  }
+
+  backgroundImageInfo(): BackgroundImageInfo | null {
+    return this.readBackgroundImageInfo();
+  }
+
+  private readBackgroundImageInfo(): BackgroundImageInfo | null {
+    const img = this.bgImage;
+    if (!img) return null;
+    const doc = this.store().doc;
+    const base = img.baseScale ?? 1;
+    return {
+      present: true,
+      name: img.posterName || "Background image",
+      fit: (img.fit ?? "custom") as ImageFit,
+      zoom: base ? round((img.scaleX ?? 1) / base, 2) : 1,
+      offsetX: Math.round((((img.left ?? doc.width / 2) - doc.width / 2) / doc.width) * 100),
+      offsetY: Math.round((((img.top ?? doc.height / 2) - doc.height / 2) / doc.height) * 100),
+      opacity: round(img.opacity ?? 1, 2),
+    };
+  }
+
+  private syncBackgroundImage(): void {
+    this.store().setBgImage(this.readBackgroundImageInfo());
+  }
+
   // ----- background & document -----
 
   applyBackground(bg: PosterBackground, updateStore = true): void {
@@ -276,6 +514,7 @@ export class CanvasEngine {
 
   setDocName(name: string): void {
     this.store().setDoc({ name });
+    this.store().setActiveProjectName(name);
     this.scheduleSave();
   }
 
@@ -306,6 +545,7 @@ export class CanvasEngine {
 
   private applyDocToCanvas(): void {
     this.applyDimensions();
+    this.syncBackgroundImage();
   }
 
   private applyDimensions(): void {
@@ -317,11 +557,87 @@ export class CanvasEngine {
     this.canvas.requestRenderAll();
   }
 
-  resizeCanvas(width: number, height: number): void {
-    this.store().setDoc({ width, height });
+  resizeCanvas(width: number, height: number, opts: { scaleContent?: boolean } = {}): void {
+    if (!this.canvas) return;
+    const scaleContent = opts.scaleContent ?? true;
+    const old = this.store().doc;
+    const newWidth = Math.max(64, Math.round(width));
+    const newHeight = Math.max(64, Math.round(height));
+    if (newWidth === old.width && newHeight === old.height) return;
+
+    const factor = scaleContent ? Math.min(newWidth / old.width, newHeight / old.height) : 1;
+    const oldCx = old.width / 2;
+    const oldCy = old.height / 2;
+    const newCx = newWidth / 2;
+    const newCy = newHeight / 2;
+    const bgInfo = this.readBackgroundImageInfo();
+
+    this.suspend += 1;
+    this.store().setDoc({ width: newWidth, height: newHeight });
+
+    for (const obj of this.canvas.getObjects()) {
+      if (obj === this.bgImage) continue;
+      obj.scaleX = (obj.scaleX ?? 1) * factor;
+      obj.scaleY = (obj.scaleY ?? 1) * factor;
+      obj.left = newCx + ((obj.left ?? 0) - oldCx) * factor;
+      obj.top = newCy + ((obj.top ?? 0) - oldCy) * factor;
+      obj.setCoords();
+    }
+    for (const textObject of this.getTextObjects()) {
+      this.normalizeScaledText(textObject);
+    }
+
+    if (this.bgImage) {
+      this.updateBackgroundImageClip();
+      if (bgInfo) {
+        this.placeBackgroundImage(bgInfo.fit, bgInfo.zoom, bgInfo.offsetX, bgInfo.offsetY);
+      }
+    }
+
+    this.suspend -= 1;
     this.applyDimensions();
     this.syncAll();
     this.commit();
+  }
+
+  resetCanvas(): void {
+    if (!this.canvas) return;
+    this.suspend += 1;
+    this.canvas.remove(...this.canvas.getObjects());
+    this.bgImage = null;
+    this.store().setBgImage(null);
+    this.store().setDoc({ background: "#F4F1EA" });
+    this.applyBackground("#F4F1EA", false);
+    this.suspend -= 1;
+    this.applyDimensions();
+    this.syncAll();
+    this.setBaseline();
+    this.persistNow();
+  }
+
+  newProject(name = "Untitled Poster"): void {
+    this.store().setProjectId(uid("project"));
+    this.projectCreatedAt = Date.now();
+    this.lastThumbnail = null;
+    this.lastThumbAt = 0;
+    this.store().setDoc({ name });
+    this.store().setActiveProjectName(name);
+    this.resetInternal("#F4F1EA");
+    this.persistNow();
+  }
+
+  private resetInternal(background: string): void {
+    if (!this.canvas) return;
+    this.suspend += 1;
+    this.canvas.remove(...this.canvas.getObjects());
+    this.bgImage = null;
+    this.store().setBgImage(null);
+    this.store().setDoc({ background });
+    this.applyBackground(background, false);
+    this.suspend -= 1;
+    this.applyDimensions();
+    this.syncAll();
+    this.setBaseline();
   }
 
   // ----- templates & creation -----
@@ -331,12 +647,15 @@ export class CanvasEngine {
     try {
       if (!this.canvas) return;
       this.canvas.remove(...this.canvas.getObjects());
+      this.bgImage = null;
+      this.store().setBgImage(null);
       this.store().setDoc({
         name: template.name,
         width: template.width,
         height: template.height,
         background: template.background,
       });
+      this.store().setActiveProjectName(template.name);
       await Promise.all(
         template.objects.map((o) => loadFont(o.fontFamily, nearestWeight(o.fontFamily, o.fontWeight))),
       );
@@ -406,6 +725,35 @@ export class CanvasEngine {
     }
   }
 
+  addImageObject(dataUrl: string, name = "Image"): void {
+    if (!this.canvas) return;
+    void fabric.FabricImage.fromURL(dataUrl, { crossOrigin: "anonymous" })
+      .then((img) => {
+        const doc = this.store().doc;
+        const natW = img.width || 1;
+        const natH = img.height || 1;
+        const scale = Math.min((doc.width * 0.6) / natW, (doc.height * 0.6) / natH);
+        img.set({
+          left: doc.width / 2,
+          top: doc.height / 2,
+          originX: "center",
+          originY: "center",
+          scaleX: scale,
+          scaleY: scale,
+        });
+        (img as PosterImage).id = this.nextId();
+        (img as PosterImage).posterName = name;
+        this.canvas!.add(img);
+        this.canvas!.setActiveObject(img);
+        this.canvas!.requestRenderAll();
+        this.syncAll();
+        this.commit();
+      })
+      .catch(() => {
+        this.store().setLastError("Could not add that image.");
+      });
+  }
+
   async duplicateSelected(): Promise<void> {
     if (!this.canvas) return;
     const objs = this.getActiveObjects();
@@ -460,7 +808,7 @@ export class CanvasEngine {
     if (direction === "up") target = Math.min(index + 1, objects.length - 1);
     if (direction === "down") target = Math.max(index - 1, 0);
     if (direction === "top") target = objects.length - 1;
-    if (direction === "bottom") target = 0;
+    if (direction === "bottom") target = this.bgImage ? 1 : 0;
     if (target === index) return;
     const data = this.canvas as unknown as { _objects: fabric.Object[] };
     data._objects.splice(index, 1);
@@ -567,10 +915,24 @@ export class CanvasEngine {
 
   // ----- history -----
 
+  private serializeObjects(includeBackgroundImage: boolean): unknown[] {
+    if (!this.canvas) return [];
+    const objects = (this.canvas as unknown as { _objects: fabric.Object[] })._objects;
+    const bg = this.bgImage;
+    let removedIndex = -1;
+    if (bg && !includeBackgroundImage) {
+      removedIndex = objects.indexOf(bg);
+      if (removedIndex >= 0) objects.splice(removedIndex, 1);
+    }
+    const serialized = this.canvas.toObject(EXTRA_PROPS as never).objects as unknown[];
+    if (removedIndex >= 0 && bg) objects.splice(removedIndex, 0, bg);
+    return serialized;
+  }
+
   private snapshot(): string {
     if (!this.canvas) return "";
     return JSON.stringify({
-      objects: this.canvas.toObject(EXTRA_PROPS as never).objects,
+      objects: this.serializeObjects(false),
       background: this.store().doc.background,
     });
   }
@@ -611,6 +973,12 @@ export class CanvasEngine {
       await this.canvas.loadFromJSON({ objects: parsed.objects, version: "6.0.0" });
       this.ensureIds();
       this.applyBackground(parsed.background, true);
+      if (this.bgImage) {
+        this.updateBackgroundImageClip();
+        const objects = (this.canvas as unknown as { _objects: fabric.Object[] })._objects;
+        if (objects.indexOf(this.bgImage) < 0) this.canvas.add(this.bgImage);
+        this.addToBottom(this.bgImage);
+      }
       this.applyDimensions();
       this.canvas.requestRenderAll();
     } catch {
@@ -642,16 +1010,18 @@ export class CanvasEngine {
   private syncLayers(): void {
     if (!this.canvas) return;
     const objects = [...this.canvas.getObjects()].reverse();
-    const layers: LayerMeta[] = objects.map((o) => {
-      const tb = o as PosterTextbox;
-      return {
-        id: tb.id,
-        name: tb.posterName || tb.text?.split("\n")[0]?.slice(0, 24) || "Text",
-        text: tb.text ?? "",
-        visible: o.visible !== false,
-        locked: Boolean(tb.locked),
-      };
-    });
+    const layers: LayerMeta[] = objects
+      .filter((o) => o instanceof fabric.Textbox)
+      .map((o) => {
+        const tb = o as PosterTextbox;
+        return {
+          id: tb.id,
+          name: tb.posterName || tb.text?.split("\n")[0]?.slice(0, 24) || "Text",
+          text: tb.text ?? "",
+          visible: o.visible !== false,
+          locked: Boolean(tb.locked),
+        };
+      });
     this.store().setLayers(layers);
   }
 
@@ -707,6 +1077,7 @@ export class CanvasEngine {
     this.ensureIds();
     this.syncLayers();
     this.syncSelected();
+    this.syncBackgroundImage();
   }
 
   // ----- persistence -----
@@ -720,41 +1091,133 @@ export class CanvasEngine {
     this.persistNow();
   }, 700);
 
+  private renderThumbnail(): string | null {
+    if (!this.canvas) return null;
+    try {
+      const doc = this.store().doc;
+      const multiplier = clamp(THUMB_MAX / Math.max(doc.width, doc.height), 0.06, 0.4);
+      return this.toDataURL({ multiplier, format: "png" });
+    } catch {
+      return null;
+    }
+  }
+
   persistNow(): void {
     if (typeof window === "undefined" || !this.canvas) return;
     const store = this.store();
-    try {
-      store.setSaveStatus("saving");
-      const project: PersistedProject = {
-        version: 1,
-        projectId: store.projectId,
-        doc: store.doc,
-        canvas: { objects: this.canvas.toObject(EXTRA_PROPS as never).objects },
-        savedAt: Date.now(),
-      };
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(project));
-      store.setSaveStatus("saved");
-    } catch {
-      store.setSaveStatus("error");
-      store.setLastError("Could not save your work locally.");
+    const now = Date.now();
+    if (!this.lastThumbnail || now - this.lastThumbAt > THUMB_INTERVAL) {
+      const thumb = this.renderThumbnail();
+      if (thumb) {
+        this.lastThumbnail = thumb;
+        this.lastThumbAt = now;
+      }
     }
+    const project: StoredProject = {
+      id: store.projectId,
+      name: store.doc.name,
+      createdAt: this.projectCreatedAt,
+      updatedAt: now,
+      version: 2,
+      doc: store.doc,
+      objects: this.serializeObjects(true),
+      thumbnail: this.lastThumbnail,
+      hasBackgroundImage: Boolean(this.bgImage),
+    };
+    store.setSaveStatus("saving");
+    void putProject(project)
+      .then(() => {
+        this.store().setSaveStatus("saved");
+        this.store().setLastSavedAt(Date.now());
+      })
+      .catch(() => {
+        this.store().setSaveStatus("error");
+        this.store().setLastError("Could not save this design locally.");
+      });
+  }
+
+  async loadProject(project: StoredProject): Promise<void> {
+    if (!this.canvas) return;
+    this.commitSoon.cancel();
+    this.suspend += 1;
+    try {
+      const store = this.store();
+      store.setProjectId(project.id);
+      store.setDoc(project.doc);
+      store.setActiveProjectName(project.name);
+      this.projectCreatedAt = project.createdAt ?? Date.now();
+      this.lastThumbnail = project.thumbnail ?? null;
+      this.lastThumbAt = 0;
+      await this.canvas.loadFromJSON({ objects: project.objects ?? [], version: "6.0.0" });
+      this.ensureIds();
+      this.bgImage = this.findBackgroundImage();
+      if (this.bgImage) {
+        this.bgImage.set({ selectable: false, evented: false, hoverCursor: "default" });
+        this.addToBottom(this.bgImage);
+        this.updateBackgroundImageClip();
+      }
+      this.applyBackground(store.doc.background, false);
+      this.applyDimensions();
+    } catch {
+      this.store().setLastError("Could not open that project.");
+    } finally {
+      this.suspend -= 1;
+    }
+    this.syncAll();
+    this.fitToViewport();
+    this.setBaseline();
+    this.store().setSaveStatus("saved");
+  }
+
+  saveAsNew(name: string): void {
+    this.store().setProjectId(uid("project"));
+    this.projectCreatedAt = Date.now();
+    this.lastThumbnail = null;
+    this.lastThumbAt = 0;
+    this.store().setDoc({ name });
+    this.store().setActiveProjectName(name);
+    this.setBaseline();
+    this.persistNow();
   }
 
   private async hydrate(): Promise<boolean> {
     if (typeof window === "undefined") return false;
+
+    // One-time migration from the previous single-project localStorage format.
     try {
       const raw = window.localStorage.getItem(STORAGE_KEY);
-      if (!raw) return false;
-      const project = JSON.parse(raw) as PersistedProject;
-      if (!project?.doc || !project?.canvas) return false;
-      const store = this.store();
-      store.setDoc(project.doc);
-      store.setProjectId(project.projectId ?? store.projectId);
+      if (raw) {
+        const legacy = JSON.parse(raw) as PersistedProject;
+        if (legacy?.doc && legacy?.canvas) {
+          this.store().setDoc(legacy.doc);
+          if (legacy.projectId) this.store().setProjectId(legacy.projectId);
+          this.suspend += 1;
+          await this.canvas!.loadFromJSON({
+            objects: (legacy.canvas as { objects?: unknown[] }).objects ?? [],
+            version: "6.0.0",
+          });
+          this.suspend -= 1;
+          this.ensureIds();
+          this.applyDocToCanvas();
+          window.localStorage.removeItem(STORAGE_KEY);
+          return true;
+        }
+      }
+    } catch {
+      /* ignore malformed legacy data */
+    }
+
+    try {
+      const projects = await listProjects();
+      if (projects.length === 0) return false;
+      const latest = projects[0];
+      this.store().setDoc(latest.doc);
+      this.store().setProjectId(latest.id);
+      this.store().setActiveProjectName(latest.name);
+      this.projectCreatedAt = latest.createdAt ?? Date.now();
+      this.lastThumbnail = latest.thumbnail ?? null;
       this.suspend += 1;
-      await this.canvas!.loadFromJSON({
-        objects: (project.canvas as { objects?: unknown[] }).objects ?? [],
-        version: "6.0.0",
-      });
+      await this.canvas!.loadFromJSON({ objects: latest.objects ?? [], version: "6.0.0" });
       this.suspend -= 1;
       this.ensureIds();
       this.applyDocToCanvas();
@@ -764,34 +1227,48 @@ export class CanvasEngine {
     }
   }
 
-  clearProject(): void {
-    if (typeof window !== "undefined") {
-      window.localStorage.removeItem(STORAGE_KEY);
-    }
+  async loadProjectById(id: string): Promise<boolean> {
+    const project = await getProject(id);
+    if (!project) return false;
+    await this.loadProject(project);
+    return true;
+  }
+
+  async deleteProjectById(id: string): Promise<void> {
+    await deleteProject(id);
   }
 
   // ----- export -----
 
-  toDataURL(multiplier: number): string {
+  toDataURL(opts: ExportRenderOptions = {}): string {
     const canvas = this.canvas;
     if (!canvas) throw new Error("Canvas is not ready.");
+    const { multiplier = 1, format = "png", quality } = opts;
     const doc = this.store().doc;
     const prevZoom = canvas.getZoom();
     const prevWidth = canvas.getWidth();
     const prevHeight = canvas.getHeight();
+    const prevBackground = canvas.backgroundColor;
+    const transparent =
+      !doc.background ||
+      (typeof doc.background === "string" &&
+        (doc.background === "" || doc.background === "transparent"));
     try {
-      // Render at 1:1 document scale so export dimensions are exact
-      // regardless of the on-screen zoom level. fabric multiplies the
-      // canvas width and its current zoom by the export multiplier.
+      // Render at 1:1 document scale so export dimensions are exact regardless
+      // of the on-screen zoom level. fabric multiplies the canvas size and its
+      // current zoom by the export multiplier.
       canvas.setZoom(1);
       canvas.setDimensions({ width: doc.width, height: doc.height });
+      if (format === "jpeg" && transparent) canvas.backgroundColor = "#FFFFFF";
       canvas.renderAll();
       return canvas.toDataURL({
-        format: "png",
+        format: format === "jpeg" ? "jpeg" : "png",
         multiplier,
+        quality: format === "jpeg" ? (quality ?? 0.92) : undefined,
         enableRetinaScaling: false,
       });
     } finally {
+      canvas.backgroundColor = prevBackground;
       canvas.setZoom(prevZoom);
       canvas.setDimensions({ width: prevWidth, height: prevHeight });
       canvas.renderAll();

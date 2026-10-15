@@ -61,7 +61,22 @@ export interface CanvasSize {
   width: number;
   height: number;
   group: "Portrait" | "Square" | "Landscape" | "Story";
+  ratio: string;
 }
+
+export type ImageFit = "cover" | "contain" | "stretch" | "custom";
+
+export interface BackgroundImageInfo {
+  present: boolean;
+  name: string;
+  fit: ImageFit;
+  zoom: number;
+  offsetX: number;
+  offsetY: number;
+  opacity: number;
+}
+
+export type ExportFormat = "png" | "jpeg";
 
 export interface PosterTemplate {
   id: string;
@@ -81,4 +96,16 @@ export interface PersistedProject {
   doc: PosterDoc;
   canvas: Record<string, unknown>;
   savedAt: number;
+}
+
+export interface StoredProject {
+  id: string;
+  name: string;
+  createdAt: number;
+  updatedAt: number;
+  version: number;
+  doc: PosterDoc;
+  objects: unknown[];
+  thumbnail?: string | null;
+  hasBackgroundImage?: boolean;
 }

@@ -1,6 +1,6 @@
 "use client";
 
-import { LayoutTemplate, Type, Wand2, PaintBucket, Layers } from "lucide-react";
+import { LayoutTemplate, Type, Wand2, PaintBucket, Layers, FolderOpen } from "lucide-react";
 import { useEditorStore } from "@/store/editorStore";
 import type { LeftTab } from "@/store/editorStore";
 import { cn } from "@/lib/utils";
@@ -9,6 +9,7 @@ import { AddTextPanel } from "./panels/AddTextPanel";
 import { AIPanel } from "./panels/AIPanel";
 import { BackgroundPanel } from "./panels/BackgroundPanel";
 import { LayersPanel } from "./panels/LayersPanel";
+import { ProjectsPanel } from "./panels/ProjectsPanel";
 
 const TABS: { id: LeftTab; label: string; icon: React.ReactNode }[] = [
   { id: "templates", label: "Templates", icon: <LayoutTemplate className="h-4 w-4" /> },
@@ -16,6 +17,7 @@ const TABS: { id: LeftTab; label: string; icon: React.ReactNode }[] = [
   { id: "ai", label: "AI", icon: <Wand2 className="h-4 w-4" /> },
   { id: "background", label: "Canvas", icon: <PaintBucket className="h-4 w-4" /> },
   { id: "layers", label: "Layers", icon: <Layers className="h-4 w-4" /> },
+  { id: "projects", label: "Projects", icon: <FolderOpen className="h-4 w-4" /> },
 ];
 
 export function LeftSidebar() {
@@ -51,6 +53,7 @@ export function LeftSidebar() {
         {leftTab === "ai" && <AIPanel />}
         {leftTab === "background" && <BackgroundPanel />}
         {leftTab === "layers" && <LayersPanel />}
+        {leftTab === "projects" && <ProjectsPanel />}
       </div>
     </aside>
   );
