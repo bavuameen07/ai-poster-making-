@@ -93,7 +93,7 @@ export function EditorShell({ initialTemplateId }: EditorShellProps) {
 
         <div
           className={cn(
-            "absolute inset-y-0 left-0 z-20 h-full w-[300px] shrink-0 shadow-pop transition-transform duration-200 ease-smooth lg:static lg:z-auto lg:translate-x-0 lg:shadow-none",
+            "absolute inset-y-0 left-0 z-20 flex h-full w-[300px] shrink-0 overflow-hidden shadow-pop transition-transform duration-200 ease-smooth lg:static lg:z-auto lg:translate-x-0 lg:shadow-none",
             leftOpen ? "translate-x-0" : "-translate-x-full",
           )}
         >
@@ -104,7 +104,7 @@ export function EditorShell({ initialTemplateId }: EditorShellProps) {
 
         <div
           className={cn(
-            "absolute inset-y-0 right-0 z-20 h-full w-[320px] shrink-0 shadow-pop transition-transform duration-200 ease-smooth lg:static lg:z-auto lg:translate-x-0 lg:shadow-none",
+            "absolute inset-y-0 right-0 z-20 flex h-full w-[320px] shrink-0 overflow-hidden shadow-pop transition-transform duration-200 ease-smooth lg:static lg:z-auto lg:translate-x-0 lg:shadow-none",
             rightOpen ? "translate-x-0" : "translate-x-full",
           )}
         >
