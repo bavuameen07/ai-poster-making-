@@ -37,24 +37,40 @@ function objectStyle(obj: PosterTextObject, scale: number): React.CSSProperties 
 export interface PosterThumbProps {
   template: PosterTemplate;
   width: number;
+  height?: number;
   className?: string;
 }
 
-export function PosterThumb({ template, width, className }: PosterThumbProps) {
-  const scale = width / template.width;
-  const height = Math.round(template.height * scale);
+export function PosterThumb({ template, width, height, className }: PosterThumbProps) {
+  const scale = Math.min(width / template.width, height ? height / template.height : Infinity);
+  const posterWidth = Math.round(template.width * scale);
+  const posterHeight = Math.round(template.height * scale);
 
   return (
     <div
       aria-hidden
-      className={cn("relative overflow-hidden rounded-[3px]", className)}
-      style={{ width, height, background: backgroundToCss(template.background) }}
+      className={cn("relative isolate overflow-hidden rounded-[3px]", className)}
+      style={{
+        width: height ? "100%" : posterWidth,
+        height: height ?? posterHeight,
+        background: backgroundToCss(template.background),
+      }}
     >
-      {template.objects.map((obj, i) => (
-        <div key={i} style={objectStyle(obj, scale)}>
-          {obj.text}
-        </div>
-      ))}
+      <div
+        className="absolute left-1/2 top-1/2 overflow-hidden"
+        style={{
+          width: posterWidth,
+          height: posterHeight,
+          transform: "translate(-50%, -50%)",
+          background: backgroundToCss(template.background),
+        }}
+      >
+        {template.objects.map((obj, i) => (
+          <div key={i} style={objectStyle(obj, scale)}>
+            {obj.text}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

@@ -51,7 +51,7 @@ export function Hero() {
 
           <dl className="mt-10 grid max-w-lg grid-cols-3 gap-4 border-t border-line pt-6">
             <Stat icon={<Type className="h-4 w-4" />} value="16" label="Studio fonts" />
-            <Stat icon={<Layers className="h-4 w-4" />} value="8" label="Starter layouts" />
+            <Stat icon={<Layers className="h-4 w-4" />} value="16" label="Starter layouts" />
             <Stat icon={<MoveHorizontal className="h-4 w-4" />} value="PNG / PDF" label="Print export" />
           </dl>
         </div>

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ImagePlus,
   Loader2,
@@ -10,6 +10,9 @@ import {
   Move,
   Layers3,
   Camera,
+  Wand2,
+  Undo2,
+  LayoutTemplate,
 } from "lucide-react";
 import { ColorField } from "@/components/ui/ColorField";
 import { Select } from "@/components/ui/Select";
@@ -23,7 +26,9 @@ import { GRADIENT_PRESETS, SOLID_SWATCHES, backgroundToCss, isGradient } from "@
 import { PALETTES } from "@/lib/palettes";
 import { cn } from "@/lib/utils";
 import type { ImageFit, LinearGradientBg } from "@/types/poster";
+import type { LayoutId } from "@/lib/autoLayout";
 import { GradientEditor } from "./GradientEditor";
+import { LayoutPreviewCard } from "./LayoutPreviewCard";
 
 type BgTab = "colour" | "gradient" | "image";
 
@@ -41,6 +46,10 @@ export function BackgroundPanel() {
   const background = doc.background;
   const bgImage = useEditorStore((s) => s.bgImage);
   const setLastError = useEditorStore((s) => s.setLastError);
+  const autoStyleText = useEditorStore((s) => s.autoStyleText);
+  const autoArrangeOnUpload = useEditorStore((s) => s.autoArrangeOnUpload);
+  const setAutoStyleText = useEditorStore((s) => s.setAutoStyleText);
+  const setAutoArrangeOnUpload = useEditorStore((s) => s.setAutoArrangeOnUpload);
 
   const [tab, setTab] = useState<BgTab>(isGradient(background) ? "gradient" : "colour");
   const [scaleContent, setScaleContent] = useState(true);
@@ -48,11 +57,36 @@ export function BackgroundPanel() {
     isGradient(background) ? background : DEFAULT_GRADIENT,
   );
   const [uploading, setUploading] = useState(false);
+  const [arranging, setArranging] = useState(false);
+  const [selectedLayout, setSelectedLayout] = useState<LayoutId | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (isGradient(background)) setGradient(background);
   }, [background]);
+
+  // Refresh the estimated compositions whenever the visible photo composition
+  // changes (fit, zoom, offset, opacity) or the auto-colour setting changes.
+  const previews = useMemo(() => {
+    const engine = getEngine();
+    if (!engine || !bgImage?.present) return [];
+    if (doc.width <= 0 || doc.height <= 0) return [];
+    return engine.getLayoutPreviews(autoStyleText);
+  }, [bgImage, doc.width, doc.height, autoStyleText]);
+
+  const previewSrc = useMemo(() => {
+    const engine = getEngine();
+    return engine && bgImage?.present ? engine.getBackgroundImageSrc() : null;
+  }, [bgImage]);
+
+  useEffect(() => {
+    const engine = getEngine();
+    if (!bgImage?.present) {
+      setSelectedLayout(null);
+      return;
+    }
+    setSelectedLayout(engine?.suggestedLayout() ?? null);
+  }, [bgImage?.present, bgImage?.name]);
 
   const solidValue =
     typeof background === "string" ? background : background.stops[0]?.color ?? "#ffffff";
@@ -74,12 +108,40 @@ export function BackgroundPanel() {
     setUploading(true);
     try {
       await engine.setBackgroundImage(file);
+      if (useEditorStore.getState().autoArrangeOnUpload) {
+        const result = engine.autoArrangeText();
+        if (result) setSelectedLayout(result.layoutId);
+        if (result && result.applied === 0) {
+          setLastError("Image added. Add a text layer to use automatic arrangement.");
+        }
+      }
     } catch (error) {
       setLastError(error instanceof Error ? error.message : "Could not use that image.");
     } finally {
       setUploading(false);
       if (fileRef.current) fileRef.current.value = "";
     }
+  };
+
+  const runAutoArrange = () => {
+    const engine = getEngine();
+    if (!engine) return;
+    setArranging(true);
+    try {
+      const result = engine.autoArrangeText();
+      if (!result) return;
+      setSelectedLayout(result.layoutId);
+      if (result.applied === 0) setLastError("There are no text layers to arrange yet.");
+    } finally {
+      setArranging(false);
+    }
+  };
+
+  const applySelectedLayout = () => {
+    const engine = getEngine();
+    if (!engine || !selectedLayout) return;
+    const result = engine.applyLayout(selectedLayout);
+    if (result.applied === 0) setLastError("There are no text layers to arrange yet.");
   };
 
   return (
@@ -314,9 +376,129 @@ export function BackgroundPanel() {
                 <span>The background image sits behind every text layer.</span>
               </div>
             )}
+
+            {bgImage?.present && (
+              <div className="space-y-3 rounded-lg border border-line bg-panel p-2.5">
+                <div className="flex items-center gap-2">
+                  <span className="flex h-6 w-6 items-center justify-center rounded-md bg-accent-wash text-accent">
+                    <Wand2 className="h-3.5 w-3.5" />
+                  </span>
+                  <div className="min-w-0">
+                    <p className="text-[13px] font-semibold text-ink">Intelligent layout</p>
+                    <p className="text-[11px] text-ink-mute">Reposition your text to suit the photo</p>
+                  </div>
+                </div>
+
+                <p className="text-[11px] leading-relaxed text-ink-mute">
+                  Your words are never changed — only moved, resized and styled for balance and
+                  readability.
+                </p>
+
+                {previews.length > 0 ? (
+                  <div className="grid grid-cols-3 gap-2">
+                    {previews.map((preview) => (
+                      <LayoutPreviewCard
+                        key={preview.id}
+                        preview={preview}
+                        doc={doc}
+                        src={previewSrc}
+                        active={selectedLayout === preview.id}
+                        onSelect={() => setSelectedLayout(preview.id)}
+                      />
+                    ))}
+                  </div>
+                ) : (
+                  <p className="rounded-md border border-dashed border-line px-2.5 py-3 text-center text-[11px] text-ink-faint">
+                    Preparing layout estimates…
+                  </p>
+                )}
+
+                <div className="flex items-center gap-2">
+                  <Button
+                    size="sm"
+                    variant="primary"
+                    className="flex-1"
+                    loading={arranging}
+                    onClick={runAutoArrange}
+                  >
+                    {!arranging && <Wand2 className="h-3.5 w-3.5" />}
+                    Auto arrange
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    disabled={!selectedLayout}
+                    onClick={applySelectedLayout}
+                  >
+                    <LayoutTemplate className="h-3.5 w-3.5" /> Apply
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    aria-label="Undo layout change"
+                    title="Undo layout change"
+                    onClick={() => getEngine()?.undo()}
+                  >
+                    <Undo2 className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
+
+                <div className="space-y-1.5 border-t border-line pt-2.5">
+                  <ToggleRow
+                    label="Auto arrange after upload"
+                    checked={autoArrangeOnUpload}
+                    onChange={setAutoArrangeOnUpload}
+                  />
+                  <ToggleRow
+                    label="Automatic text colour"
+                    checked={autoStyleText}
+                    onChange={setAutoStyleText}
+                  />
+                </div>
+
+                <p className="text-[10px] leading-relaxed text-ink-faint">
+                  Placement uses local brightness, contrast and edge analysis. It does not detect
+                  faces or specific objects — treat the suggestions as a starting point.
+                </p>
+              </div>
+            )}
           </div>
         )}
       </section>
     </div>
+  );
+}
+
+function ToggleRow({
+  label,
+  checked,
+  onChange,
+}: {
+  label: string;
+  checked: boolean;
+  onChange: (value: boolean) => void;
+}) {
+  return (
+    <label className="flex cursor-pointer items-center justify-between gap-2">
+      <span className="text-xs text-ink-soft">{label}</span>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={checked}
+        aria-label={label}
+        onClick={() => onChange(!checked)}
+        className={cn(
+          "relative h-5 w-9 shrink-0 rounded-full transition-colors",
+          checked ? "bg-accent" : "bg-line",
+        )}
+      >
+        <span
+          className={cn(
+            "absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-all",
+            checked ? "left-[18px]" : "left-0.5",
+          )}
+        />
+      </button>
+    </label>
   );
 }
