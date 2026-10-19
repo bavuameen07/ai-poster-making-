@@ -1,6 +1,7 @@
 import * as fabric from "fabric";
 import type {
   BackgroundImageInfo,
+  DetectedTextRegion,
   ImageFit,
   LayerMeta,
   PersistedProject,
@@ -11,12 +12,27 @@ import type {
   StoredProject,
   TextAlign,
 } from "@/types/poster";
-import type { SelectedObjectProps } from "@/store/editorStore";
+import type { SelectedImageProps, SelectedObjectProps } from "@/store/editorStore";
 import { useEditorStore } from "@/store/editorStore";
 import { clamp, debounce, round, uid } from "@/lib/utils";
 import { loadFont, nearestWeight, preloadAllFonts } from "@/lib/fonts";
 import { TEMPLATES } from "@/lib/templates";
 import { deleteProject, getProject, listProjects, putProject } from "@/lib/storage/db";
+import {
+  analyzeImageData,
+  analysisSize,
+  buildLayoutPreviews,
+  classifyRole,
+  drawPosterBackground,
+  planLayout,
+  suggestLayout,
+  type DocSize,
+  type ImageAnalysis,
+  type LayoutId,
+  type LayoutPreview,
+  type PlacementPlan,
+  type PlanInput,
+} from "@/lib/autoLayout";
 
 type PosterTextbox = fabric.Textbox & {
   id: string;
@@ -27,12 +43,22 @@ type PosterTextbox = fabric.Textbox & {
 type PosterImage = fabric.FabricImage & {
   id?: string;
   posterName?: string;
+  locked?: boolean;
   role?: string;
   fit?: ImageFit;
   baseScale?: number;
 };
 
-const EXTRA_PROPS = ["id", "posterName", "locked", "role", "fit", "baseScale"];
+type PosterArtworkImage = PosterImage & { role?: "poster-art" };
+
+type EditableObject = fabric.Object & {
+  id?: string;
+  posterName?: string;
+  locked?: boolean;
+  role?: string;
+};
+
+const EXTRA_PROPS = ["id", "posterName", "locked", "role", "fit", "baseScale", "offsetX", "offsetY"];
 export const STORAGE_KEY = "ai-typography-poster:project:v1";
 const HISTORY_LIMIT = 60;
 const MIN_ZOOM = 0.1;
@@ -95,6 +121,7 @@ export class CanvasEngine {
   private counter = 0;
   private viewport = { width: 900, height: 700 };
   private bgImage: PosterImage | null = null;
+  private imageAnalysis: ImageAnalysis | null = null;
   private projectCreatedAt = Date.now();
   private lastThumbnail: string | null = null;
   private lastThumbAt = 0;
@@ -273,21 +300,43 @@ export class CanvasEngine {
     return this.canvas.getObjects().filter((o) => o instanceof fabric.Textbox) as PosterTextbox[];
   }
 
-  private getActiveObjects(): PosterTextbox[] {
+  private getEditableObjects(): fabric.Object[] {
     if (!this.canvas) return [];
-    const active = this.canvas.getActiveObjects();
-    return active.filter((o) => o instanceof fabric.Textbox) as PosterTextbox[];
+    return this.canvas.getObjects().filter((o) => (o as EditableObject).role !== "background");
   }
 
-  private findById(id: string): PosterTextbox | null {
-    return this.getTextObjects().find((o) => o.id === id) ?? null;
+  private getActiveObjects(): fabric.Object[] {
+    if (!this.canvas) return [];
+    return this.canvas.getActiveObjects().filter((o) => (o as EditableObject).role !== "background");
+  }
+
+  private getActiveTextObjects(): PosterTextbox[] {
+    return this.getActiveObjects().filter((o) => o instanceof fabric.Textbox) as PosterTextbox[];
+  }
+
+  private getActiveImages(): PosterImage[] {
+    return this.getActiveObjects().filter(
+      (o) => o instanceof fabric.FabricImage && (o as EditableObject).role !== "background",
+    ) as PosterImage[];
+  }
+
+  private findById(id: string): EditableObject | null {
+    return (this.getEditableObjects().find((o) => (o as EditableObject).id === id) as
+      | EditableObject
+      | undefined) ?? null;
   }
 
   private ensureIds(): void {
-    for (const obj of this.getTextObjects()) {
-      if (!obj.id) obj.id = this.nextId();
-      if (!obj.posterName) obj.posterName = obj.text.split("\n")[0].slice(0, 24) || "Text";
-      if (typeof obj.locked !== "boolean") obj.locked = false;
+    for (const obj of this.getEditableObjects()) {
+      const o = obj as EditableObject;
+      if (!o.id) o.id = this.nextId();
+      if (!o.posterName) {
+        o.posterName =
+          obj instanceof fabric.Textbox
+            ? obj.text.split("\n")[0].slice(0, 24) || "Text"
+            : "Image";
+      }
+      if (typeof o.locked !== "boolean") o.locked = false;
     }
   }
 
@@ -315,6 +364,16 @@ export class CanvasEngine {
     const index = objects.indexOf(obj);
     if (index >= 0) objects.splice(index, 1);
     objects.unshift(obj);
+    this.canvas.requestRenderAll();
+  }
+
+  private addPosterArtworkUnderText(obj: fabric.Object): void {
+    if (!this.canvas) return;
+    const objects = (this.canvas as unknown as { _objects: fabric.Object[] })._objects;
+    const oldIndex = objects.indexOf(obj);
+    if (oldIndex >= 0) objects.splice(oldIndex, 1);
+    const backgroundIndex = this.bgImage ? objects.indexOf(this.bgImage) : -1;
+    objects.splice(backgroundIndex >= 0 ? backgroundIndex + 1 : 0, 0, obj);
     this.canvas.requestRenderAll();
   }
 
@@ -406,11 +465,25 @@ export class CanvasEngine {
     img.baseScale = 1;
     img.fit = "cover";
     this.bgImage = img;
+    for (const object of this.canvas.getObjects()) {
+      if ((object as PosterImage).role === "poster-art") object.visible = false;
+    }
+    this.imageAnalysis = null;
     this.canvas.add(img);
     this.addToBottom(img);
     this.updateBackgroundImageClip();
-    this.placeBackgroundImage("cover", 1, 0, 0);
+    // Preserve the photo's aspect ratio: only crop when it closely matches the
+    // poster, otherwise letterbox it inside the canvas with "contain".
+    const doc = this.store().doc;
+    const natW = img.width || 1;
+    const natH = img.height || 1;
+    const docAspect = doc.width / doc.height;
+    const imgAspect = natW / natH;
+    const fit: ImageFit = Math.abs(Math.log(imgAspect / docAspect)) < 0.08 ? "cover" : "contain";
+    this.placeBackgroundImage(fit, 1, 0, 0);
     this.suspend -= 1;
+    this.store().setImageMode("background");
+    this.store().setDetectedText([]);
     this.canvas.requestRenderAll();
     this.syncAll();
     this.scheduleSave();
@@ -418,6 +491,7 @@ export class CanvasEngine {
 
   setBackgroundImageFit(fit: ImageFit): void {
     if (!this.bgImage) return;
+    this.imageAnalysis = null;
     this.placeBackgroundImage(fit, 1, 0, 0);
     this.canvas?.requestRenderAll();
     this.syncBackgroundImage();
@@ -427,6 +501,7 @@ export class CanvasEngine {
   setBackgroundImageZoom(zoom: number): void {
     const img = this.bgImage;
     if (!img || !this.canvas) return;
+    this.imageAnalysis = null;
     const base = img.baseScale ?? 1;
     const next = base * clamp(zoom, 0.2, 4);
     img.set({ scaleX: next, scaleY: next, fit: img.fit === "stretch" ? "custom" : img.fit });
@@ -440,6 +515,7 @@ export class CanvasEngine {
   setBackgroundImageOffset(offsetX: number, offsetY: number): void {
     const img = this.bgImage;
     if (!img || !this.canvas) return;
+    this.imageAnalysis = null;
     const doc = this.store().doc;
     img.set({
       left: doc.width / 2 + (offsetX / 100) * doc.width,
@@ -454,6 +530,7 @@ export class CanvasEngine {
   setBackgroundImageOpacity(opacity: number): void {
     const img = this.bgImage;
     if (!img || !this.canvas) return;
+    this.imageAnalysis = null;
     img.set({ opacity: clamp(opacity, 0.05, 1) });
     this.canvas.requestRenderAll();
     this.syncBackgroundImage();
@@ -464,6 +541,20 @@ export class CanvasEngine {
     if (!this.bgImage || !this.canvas) return;
     this.canvas.remove(this.bgImage);
     this.bgImage = null;
+    this.imageAnalysis = null;
+    this.canvas.requestRenderAll();
+    this.syncAll();
+    this.scheduleSave();
+  }
+
+  switchImageMode(mode: "poster" | "background"): void {
+    if (!this.canvas) return;
+    this.store().setImageMode(mode);
+    for (const object of this.canvas.getObjects()) {
+      const role = (object as PosterImage).role;
+      if (role === "poster-art") object.visible = mode === "poster";
+      if (role === "background") object.visible = mode === "background";
+    }
     this.canvas.requestRenderAll();
     this.syncAll();
     this.scheduleSave();
@@ -495,6 +586,209 @@ export class CanvasEngine {
 
   private syncBackgroundImage(): void {
     this.store().setBgImage(this.readBackgroundImageInfo());
+  }
+
+  // ----- intelligent background analysis & auto layout -----
+
+  getBackgroundImageSrc(): string | null {
+    const img = this.bgImage as unknown as { getSrc?: () => string } | null;
+    if (!img || typeof img.getSrc !== "function") return null;
+    try {
+      return img.getSrc();
+    } catch {
+      return null;
+    }
+  }
+
+  private imageElement(): CanvasImageSource | null {
+    const img = this.bgImage as unknown as {
+      getElement?: () => CanvasImageSource | null;
+      _element?: CanvasImageSource;
+    } | null;
+    if (!img) return null;
+    try {
+      if (typeof img.getElement === "function") return img.getElement();
+    } catch {
+      /* fall through to the raw element */
+    }
+    return img._element ?? null;
+  }
+
+  private analysisInputs(): PlanInput[] {
+    const doc = this.store().doc;
+    const size: DocSize = { width: doc.width, height: doc.height };
+    return this.getTextObjects().map((tb) => {
+      const props = this.readProps(tb);
+      const role = classifyRole(
+        {
+          text: props.text,
+          name: props.name,
+          fontSize: props.fontSize,
+          charSpacing: props.charSpacing,
+          fontStyle: props.fontStyle,
+        },
+        size,
+      );
+      return {
+        id: props.id,
+        text: props.text,
+        name: props.name,
+        role,
+        fontFamily: props.fontFamily,
+        fontWeight: props.fontWeight,
+        fontStyle: props.fontStyle,
+        fontSize: props.fontSize,
+        textAlign: props.textAlign,
+        charSpacing: props.charSpacing,
+        lineHeight: props.lineHeight,
+        fill: props.fill,
+        shadow: props.shadow,
+        backgroundColor: props.backgroundColor,
+        stroke: props.stroke,
+        strokeWidth: props.strokeWidth,
+      };
+    });
+  }
+
+  /**
+   * Draw the *visible* background (honouring fit, zoom, offset, opacity and the
+   * poster background beneath it) into a small offscreen canvas and analyse it.
+   * Returns null when the image or a 2D context is unavailable.
+   */
+  analyzeBackground(): ImageAnalysis | null {
+    if (!this.bgImage) return null;
+    const el = this.imageElement();
+    if (!el) return null;
+    const doc = this.store().doc;
+    const { resW, resH } = analysisSize(doc);
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = resW;
+      canvas.height = resH;
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      if (!ctx) return null;
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
+      drawPosterBackground(ctx, this.store().doc.background, resW, resH);
+
+      const img = this.bgImage;
+      const sx = resW / doc.width;
+      const sy = resH / doc.height;
+      const natW = img.width || 1;
+      const natH = img.height || 1;
+      const dw = natW * (img.scaleX ?? 1) * sx;
+      const dh = natH * (img.scaleY ?? 1) * sy;
+      const cx = (img.left ?? doc.width / 2) * sx;
+      const cy = (img.top ?? doc.height / 2) * sy;
+      ctx.globalAlpha = clamp(img.opacity ?? 1, 0, 1);
+      ctx.drawImage(el, cx - dw / 2, cy - dh / 2, dw, dh);
+      ctx.globalAlpha = 1;
+
+      const data = ctx.getImageData(0, 0, resW, resH);
+      return analyzeImageData(data, { width: doc.width, height: doc.height });
+    } catch {
+      // Tainted canvas or unsupported source — degrade gracefully.
+      return null;
+    }
+  }
+
+  private ensureAnalysis(): ImageAnalysis | null {
+    if (!this.bgImage) return null;
+    if (!this.imageAnalysis) this.imageAnalysis = this.analyzeBackground();
+    return this.imageAnalysis;
+  }
+
+  suggestedLayout(): LayoutId | null {
+    const analysis = this.ensureAnalysis();
+    if (!analysis) return null;
+    return suggestLayout(analysis);
+  }
+
+  getLayoutPreviews(autoColor = this.store().autoStyleText): LayoutPreview[] {
+    const analysis = this.ensureAnalysis();
+    if (!analysis) return [];
+    const doc = this.store().doc;
+    return buildLayoutPreviews(
+      this.analysisInputs(),
+      analysis,
+      { width: doc.width, height: doc.height },
+      autoColor,
+    );
+  }
+
+  private planFor(layoutId: LayoutId, autoColor: boolean): PlacementPlan[] {
+    const analysis = this.ensureAnalysis();
+    if (!analysis) return [];
+    const doc = this.store().doc;
+    return planLayout(
+      this.analysisInputs(),
+      analysis,
+      { width: doc.width, height: doc.height },
+      layoutId,
+      { autoColor },
+    );
+  }
+
+  private applyPlacements(plans: PlacementPlan[], autoColor: boolean): number {
+    if (!this.canvas || plans.length === 0) return 0;
+    this.suspend += 1;
+    let applied = 0;
+    for (const plan of plans) {
+      const obj = this.findById(plan.id);
+      if (!obj || !(obj instanceof fabric.Textbox)) continue;
+      obj.set({
+        left: plan.left,
+        top: plan.top,
+        width: plan.width,
+        fontSize: plan.fontSize,
+        fontWeight: plan.fontWeight,
+        charSpacing: plan.charSpacing,
+        lineHeight: plan.lineHeight,
+        textAlign: plan.textAlign,
+      });
+      if (autoColor) {
+        obj.set({
+          fill: plan.fill,
+          shadow: plan.shadow ? createShadow(plan.shadow) : null,
+          backgroundColor: plan.backgroundColor,
+          stroke: plan.stroke,
+          strokeWidth: plan.strokeWidth,
+        });
+      }
+      obj.setCoords();
+      applied++;
+    }
+    this.suspend -= 1;
+    this.canvas.requestRenderAll();
+    this.syncAll();
+    return applied;
+  }
+
+  /** Apply a specific composition to the existing text layers (undoable). */
+  applyLayout(
+    layoutId: LayoutId,
+    opts: { autoColor?: boolean } = {},
+  ): { applied: number; layoutId: LayoutId } {
+    const autoColor = opts.autoColor ?? this.store().autoStyleText;
+    const plans = this.planFor(layoutId, autoColor);
+    const applied = this.applyPlacements(plans, autoColor);
+    if (applied > 0) {
+      this.commit();
+    }
+    return { applied, layoutId };
+  }
+
+  /**
+   * Automatically choose and apply the composition that best fits the uploaded
+   * photo (based on the estimated focal area). Never invents text.
+   */
+  autoArrangeText(
+    opts: { layoutId?: LayoutId; autoColor?: boolean } = {},
+  ): { applied: number; layoutId: LayoutId } | null {
+    if (!this.bgImage) return null;
+    const autoColor = opts.autoColor ?? this.store().autoStyleText;
+    const layoutId = opts.layoutId ?? this.suggestedLayout() ?? "centered-focus";
+    return this.applyLayout(layoutId, { autoColor });
   }
 
   // ----- background & document -----
@@ -571,6 +865,7 @@ export class CanvasEngine {
     const newCx = newWidth / 2;
     const newCy = newHeight / 2;
     const bgInfo = this.readBackgroundImageInfo();
+    this.imageAnalysis = null;
 
     this.suspend += 1;
     this.store().setDoc({ width: newWidth, height: newHeight });
@@ -605,6 +900,7 @@ export class CanvasEngine {
     this.suspend += 1;
     this.canvas.remove(...this.canvas.getObjects());
     this.bgImage = null;
+    this.imageAnalysis = null;
     this.store().setBgImage(null);
     this.store().setDoc({ background: "#F4F1EA" });
     this.applyBackground("#F4F1EA", false);
@@ -631,6 +927,7 @@ export class CanvasEngine {
     this.suspend += 1;
     this.canvas.remove(...this.canvas.getObjects());
     this.bgImage = null;
+    this.imageAnalysis = null;
     this.store().setBgImage(null);
     this.store().setDoc({ background });
     this.applyBackground(background, false);
@@ -648,7 +945,10 @@ export class CanvasEngine {
       if (!this.canvas) return;
       this.canvas.remove(...this.canvas.getObjects());
       this.bgImage = null;
+      this.imageAnalysis = null;
       this.store().setBgImage(null);
+      this.store().setDetectedText([]);
+      this.store().setImageMode("poster");
       this.store().setDoc({
         name: template.name,
         width: template.width,
@@ -725,33 +1025,263 @@ export class CanvasEngine {
     }
   }
 
-  addImageObject(dataUrl: string, name = "Image"): void {
+  async addImageObject(dataUrl: string, name = "Image"): Promise<void> {
     if (!this.canvas) return;
-    void fabric.FabricImage.fromURL(dataUrl, { crossOrigin: "anonymous" })
-      .then((img) => {
-        const doc = this.store().doc;
-        const natW = img.width || 1;
-        const natH = img.height || 1;
-        const scale = Math.min((doc.width * 0.6) / natW, (doc.height * 0.6) / natH);
-        img.set({
-          left: doc.width / 2,
-          top: doc.height / 2,
-          originX: "center",
-          originY: "center",
-          scaleX: scale,
-          scaleY: scale,
-        });
-        (img as PosterImage).id = this.nextId();
-        (img as PosterImage).posterName = name;
-        this.canvas!.add(img);
-        this.canvas!.setActiveObject(img);
-        this.canvas!.requestRenderAll();
-        this.syncAll();
-        this.commit();
-      })
-      .catch(() => {
-        this.store().setLastError("Could not add that image.");
-      });
+    let img: PosterImage;
+    try {
+      img = (await fabric.FabricImage.fromURL(dataUrl, { crossOrigin: "anonymous" })) as PosterImage;
+    } catch {
+      throw new Error("Could not load that image. It may be corrupt or unsupported.");
+    }
+    const doc = this.store().doc;
+    const natW = img.width || 1;
+    const natH = img.height || 1;
+    const scale = Math.min((doc.width * 0.6) / natW, (doc.height * 0.6) / natH);
+    img.set({
+      left: doc.width / 2,
+      top: doc.height / 2,
+      originX: "center",
+      originY: "center",
+      scaleX: scale,
+      scaleY: scale,
+    });
+    img.id = this.nextId();
+    img.posterName = name || "Image";
+    img.locked = false;
+    this.suppressCommit = true;
+    this.canvas.add(img);
+    this.canvas.setActiveObject(img);
+    this.suppressCommit = false;
+    this.canvas.requestRenderAll();
+    this.syncAll();
+    this.commit();
+  }
+
+  async addImageFromFile(file: File): Promise<void> {
+    if (!ALLOWED_IMAGE_TYPES.includes(file.type)) {
+      throw new Error("Unsupported image type. Please upload a JPG, PNG or WebP file.");
+    }
+    if (file.size > MAX_IMAGE_BYTES) {
+      throw new Error("That image is too large. Please use a file under 15 MB.");
+    }
+    const dataUrl = await this.readFileAsDataURL(file);
+    await this.addImageObject(dataUrl, file.name);
+  }
+
+  async addPosterImageFromFile(file: File): Promise<void> {
+    if (!this.canvas) throw new Error("The editor canvas is not ready yet.");
+    if (!ALLOWED_IMAGE_TYPES.includes(file.type)) throw new Error("Unsupported image type. Please upload a JPG, PNG or WebP file.");
+    if (file.size > MAX_IMAGE_BYTES) throw new Error("That image is too large. Please use a file under 15 MB.");
+    const dataUrl = await this.readFileAsDataURL(file);
+    let image: PosterArtworkImage;
+    try {
+      image = (await fabric.FabricImage.fromURL(dataUrl, { crossOrigin: "anonymous" })) as PosterArtworkImage;
+    } catch {
+      throw new Error("Could not load that image. It may be corrupt or unsupported.");
+    }
+    const doc = this.store().doc;
+    const scale = Math.min(doc.width / (image.width || 1), doc.height / (image.height || 1));
+    image.id = this.nextId();
+    image.role = "poster-art";
+    image.fit = "contain";
+    image.baseScale = scale;
+    (image as PosterArtworkImage & { offsetX?: number; offsetY?: number }).offsetX = 0;
+    (image as PosterArtworkImage & { offsetX?: number; offsetY?: number }).offsetY = 0;
+    image.posterName = file.name || "Poster artwork";
+    image.locked = true;
+    image.set({
+      left: doc.width / 2, top: doc.height / 2, originX: "center", originY: "center",
+      scaleX: scale, scaleY: scale, selectable: false, evented: false,
+    });
+    this.suspend += 1;
+    const previous = this.canvas.getObjects().filter((obj) => (obj as PosterImage).role === "poster-art");
+    this.canvas.remove(...previous);
+    if (this.bgImage) this.bgImage.visible = false;
+    this.canvas.add(image);
+    this.addPosterArtworkUnderText(image);
+    this.suspend -= 1;
+    this.store().setImageMode("poster");
+    image.visible = true;
+    this.syncPosterArtwork();
+    this.store().setDetectedText([]);
+    this.canvas.requestRenderAll();
+    this.syncAll();
+    this.commit();
+  }
+
+  getPosterImageForOCR(): { dataUrl: string; width: number; height: number; left: number; top: number; scaleX: number; scaleY: number } | null {
+    const image = this.canvas?.getObjects().find((obj) => (obj as PosterImage).role === "poster-art") as PosterArtworkImage | undefined;
+    if (!image) return null;
+    const element = image.getElement() as HTMLImageElement;
+    const canvas = document.createElement("canvas");
+    canvas.width = image.width || element.naturalWidth || 1;
+    canvas.height = image.height || element.naturalHeight || 1;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    ctx.drawImage(element, 0, 0, canvas.width, canvas.height);
+    return {
+      dataUrl: canvas.toDataURL("image/png"), width: canvas.width, height: canvas.height,
+      left: (image.left || 0) - (canvas.width * (image.scaleX || 1)) / 2,
+      top: (image.top || 0) - (canvas.height * (image.scaleY || 1)) / 2,
+      scaleX: image.scaleX || 1, scaleY: image.scaleY || 1,
+    };
+  }
+
+  private syncPosterArtwork(): void {
+    const art = this.canvas?.getObjects().find((obj) => (obj as PosterImage).role === "poster-art") as (PosterArtworkImage & { offsetX?: number; offsetY?: number }) | undefined;
+    if (!art) { this.store().setPosterArt(null); return; }
+    const doc = this.store().doc;
+    const base = art.baseScale || 1;
+    this.store().setPosterArt({
+      present: true, name: art.posterName || "Poster artwork", fit: art.fit ?? "contain",
+      zoom: round((art.scaleX || base) / base, 2),
+      offsetX: Math.round(art.offsetX ?? (((art.left ?? doc.width / 2) - doc.width / 2) / doc.width) * 100),
+      offsetY: Math.round(art.offsetY ?? (((art.top ?? doc.height / 2) - doc.height / 2) / doc.height) * 100),
+      opacity: art.opacity ?? 1,
+    });
+  }
+
+  private placePosterArtwork(fit: ImageFit, zoom: number, offsetX: number, offsetY: number): void {
+    const art = this.canvas?.getObjects().find((obj) => (obj as PosterImage).role === "poster-art") as (PosterArtworkImage & { offsetX?: number; offsetY?: number }) | undefined;
+    if (!art || !this.canvas) return;
+    const doc = this.store().doc;
+    const nw = art.width || 1; const nh = art.height || 1;
+    const base = fit === "cover" || fit === "custom" ? Math.max(doc.width / nw, doc.height / nh) : Math.min(doc.width / nw, doc.height / nh);
+    art.fit = fit; art.baseScale = base; art.offsetX = offsetX; art.offsetY = offsetY;
+    const scale = fit === "stretch" ? doc.width / nw : base * zoom;
+    art.set({ left: doc.width / 2 + offsetX / 100 * doc.width, top: doc.height / 2 + offsetY / 100 * doc.height,
+      scaleX: scale, scaleY: fit === "stretch" ? doc.height / nh : scale });
+    art.setCoords(); art.dirty = true;
+    this.canvas.requestRenderAll(); this.syncPosterArtwork(); this.scheduleSave();
+  }
+
+  setPosterImageFit(fit: ImageFit): void { this.placePosterArtwork(fit, fit === "custom" ? 1.15 : 1, 0, 0); }
+  setPosterImageZoom(zoom: number): void {
+    const art = this.canvas?.getObjects().find((obj) => (obj as PosterImage).role === "poster-art") as (PosterArtworkImage & { offsetX?: number; offsetY?: number }) | undefined;
+    if (art) this.placePosterArtwork(art.fit ?? "contain", clamp(zoom, 0.2, 4), art.offsetX ?? 0, art.offsetY ?? 0);
+  }
+  setPosterImageOffset(offsetX: number, offsetY: number): void {
+    const art = this.canvas?.getObjects().find((obj) => (obj as PosterImage).role === "poster-art") as (PosterArtworkImage & { offsetX?: number; offsetY?: number }) | undefined;
+    if (art) this.placePosterArtwork(art.fit ?? "contain", this.store().posterArt?.zoom ?? 1, offsetX, offsetY);
+  }
+
+  mapOCRRegions(regions: Array<{ text: string; confidence: number; left: number; top: number; width: number; height: number }>): DetectedTextRegion[] {
+    const image = this.getPosterImageForOCR();
+    if (!image) return [];
+    return regions.filter((r) => r.text.trim()).map((r) => ({
+      id: uid("ocr"), text: r.text.trim(), confidence: Math.round(r.confidence),
+      left: Math.max(0, image.left + r.left * image.scaleX),
+      top: Math.max(0, image.top + r.top * image.scaleY),
+      width: Math.min(r.width * image.scaleX, this.store().doc.width),
+      height: Math.min(r.height * image.scaleY, this.store().doc.height),
+    }));
+  }
+
+  async addOCRReplacement(region: DetectedTextRegion, text: string): Promise<void> {
+    const doc = this.store().doc;
+    const width = Math.min(region.width, doc.width - region.left);
+    const left = Math.max(0, Math.min(region.left, doc.width - width));
+    const top = Math.max(0, Math.min(region.top, doc.height - region.height));
+    await this.addTextObject({
+      text: text || region.text, left, top, width,
+      fontSize: Math.max(12, Math.round(region.height * 0.8)),
+      fontFamily: "Inter", fontWeight: 700, fill: "#111111", textAlign: "left",
+      lineHeight: 1, charSpacing: 0, name: `Replacement: ${text || region.text}`,
+    }, { edit: false });
+  }
+
+  coverOCRRegion(region: DetectedTextRegion): void {
+    if (!this.canvas) return;
+    const art = this.canvas.getObjects().find((obj) => (obj as PosterImage).role === "poster-art") as PosterArtworkImage | undefined;
+    if (!art) throw new Error("Poster artwork is no longer available.");
+    const x = (region.left - ((art.left || 0) - (art.width || 0) * (art.scaleX || 1) / 2)) / (art.scaleX || 1);
+    const y = (region.top - ((art.top || 0) - (art.height || 0) * (art.scaleY || 1) / 2)) / (art.scaleY || 1);
+    const w = Math.max(1, region.width / (art.scaleX || 1));
+    const h = Math.max(1, region.height / (art.scaleY || 1));
+    const scratch = document.createElement("canvas");
+    scratch.width = art.width || 1; scratch.height = art.height || 1;
+    const ctx = scratch.getContext("2d");
+    if (!ctx) throw new Error("Local image cleanup is unavailable in this browser.");
+    ctx.drawImage(art.getElement(), 0, 0, scratch.width, scratch.height);
+    const imageData = ctx.getImageData(0, 0, scratch.width, scratch.height);
+    const samples: number[][] = [];
+    const steps = 8;
+    for (let i = 0; i < steps; i++) {
+      const t = i / (steps - 1);
+      for (const [sx, sy] of [[x + t * w, y - 2], [x + t * w, y + h + 2], [x - 2, y + t * h], [x + w + 2, y + t * h]]) {
+        const px = Math.max(0, Math.min(scratch.width - 1, Math.round(sx)));
+        const py = Math.max(0, Math.min(scratch.height - 1, Math.round(sy)));
+        const idx = (py * scratch.width + px) * 4;
+        samples.push([imageData.data[idx], imageData.data[idx + 1], imageData.data[idx + 2]]);
+      }
+    }
+    const color = `rgb(${[0, 1, 2].map((channel) => Math.round(samples.reduce((sum, p) => sum + p[channel], 0) / samples.length)).join(",")})`;
+    const cover = new fabric.Rect({
+      left: region.left, top: region.top, width: region.width, height: region.height,
+      originX: "left", originY: "top", fill: color, selectable: true, evented: true,
+    }) as EditableObject;
+    cover.id = this.nextId(); cover.posterName = `Cover: ${region.text}`;
+    this.canvas.add(cover);
+    this.canvas.requestRenderAll();
+    this.syncAll();
+    this.commit();
+  }
+
+  async replaceSelectedImage(file: File): Promise<void> {
+    const img = this.getActiveImages()[0];
+    if (!img || !this.canvas) return;
+    if (!ALLOWED_IMAGE_TYPES.includes(file.type)) {
+      throw new Error("Unsupported image type. Please upload a JPG, PNG or WebP file.");
+    }
+    if (file.size > MAX_IMAGE_BYTES) {
+      throw new Error("That image is too large. Please use a file under 15 MB.");
+    }
+    const dataUrl = await this.readFileAsDataURL(file);
+    const prevW = (img.width || 1) * (img.scaleX ?? 1);
+    const prevH = (img.height || 1) * (img.scaleY ?? 1);
+    await img.setSrc(dataUrl, { crossOrigin: "anonymous" });
+    img.posterName = file.name || img.posterName;
+    const natW = img.width || 1;
+    const natH = img.height || 1;
+    img.set({ scaleX: prevW / natW, scaleY: prevH / natH });
+    img.setCoords();
+    this.canvas.requestRenderAll();
+    this.syncAll();
+    this.commit();
+  }
+
+  updateSelectedImage(
+    patch: Partial<SelectedImageProps>,
+    commit: "now" | "soon" | "none" = "soon",
+  ): void {
+    const images = this.getActiveImages();
+    if (images.length === 0 || !this.canvas) return;
+
+    for (const img of images) {
+      const natW = img.width || 1;
+      const natH = img.height || 1;
+      if (typeof patch.opacity === "number") img.set({ opacity: clamp(patch.opacity, 0.05, 1) });
+      if (typeof patch.angle === "number") img.set({ angle: patch.angle });
+      if (typeof patch.left === "number") img.set({ left: patch.left });
+      if (typeof patch.top === "number") img.set({ top: patch.top });
+      if (typeof patch.width === "number") img.set({ scaleX: Math.max(8, patch.width) / natW });
+      if (typeof patch.height === "number") img.set({ scaleY: Math.max(8, patch.height) / natH });
+      if (typeof patch.visible === "boolean") img.visible = patch.visible;
+      if (typeof patch.name === "string") img.posterName = patch.name;
+      if (typeof patch.locked === "boolean") {
+        img.locked = patch.locked;
+        img.selectable = !patch.locked;
+        img.evented = !patch.locked;
+      }
+      img.setCoords();
+    }
+
+    this.canvas.requestRenderAll();
+    this.syncSelected();
+    this.syncLayers();
+    if (commit === "now") this.commit();
+    else if (commit === "soon") this.commitSoon();
+    else this.scheduleSave();
   }
 
   async duplicateSelected(): Promise<void> {
@@ -760,7 +1290,7 @@ export class CanvasEngine {
     if (objs.length === 0) return;
     this.suppressCommit = true;
     const serialized = objs.map((o) => o.toObject(EXTRA_PROPS as never));
-    const enlivened = await fabric.util.enlivenObjects<PosterTextbox>(serialized);
+    const enlivened = await fabric.util.enlivenObjects<EditableObject>(serialized);
     const clones = enlivened.map((clone) => {
       clone.id = this.nextId();
       clone.posterName = `${clone.posterName ?? "Text"} copy`;
@@ -869,7 +1399,7 @@ export class CanvasEngine {
   // ----- property editing -----
 
   updateSelected(patch: Partial<SelectedObjectProps>, commit: "now" | "soon" | "none" = "soon"): void {
-    const objs = this.getActiveObjects();
+    const objs = this.getActiveTextObjects();
     if (objs.length === 0 || !this.canvas) return;
     const { shadow, locked, ...rest } = patch;
 
@@ -934,6 +1464,8 @@ export class CanvasEngine {
     return JSON.stringify({
       objects: this.serializeObjects(false),
       background: this.store().doc.background,
+      imageMode: this.store().imageMode,
+      detectedText: this.store().detectedText,
     });
   }
 
@@ -969,9 +1501,12 @@ export class CanvasEngine {
     if (!this.canvas || !snapshot) return;
     this.suspend += 1;
     try {
-      const parsed = JSON.parse(snapshot) as { objects: unknown[]; background: PosterBackground };
+      const parsed = JSON.parse(snapshot) as { objects: unknown[]; background: PosterBackground; imageMode?: "poster" | "background"; detectedText?: DetectedTextRegion[] };
+      this.store().setImageMode(parsed.imageMode ?? "background");
+      this.store().setDetectedText(parsed.detectedText ?? []);
       await this.canvas.loadFromJSON({ objects: parsed.objects, version: "6.0.0" });
       this.ensureIds();
+      this.imageAnalysis = null;
       this.applyBackground(parsed.background, true);
       if (this.bgImage) {
         this.updateBackgroundImageClip();
@@ -1010,18 +1545,32 @@ export class CanvasEngine {
   private syncLayers(): void {
     if (!this.canvas) return;
     const objects = [...this.canvas.getObjects()].reverse();
-    const layers: LayerMeta[] = objects
-      .filter((o) => o instanceof fabric.Textbox)
-      .map((o) => {
+    const layers: LayerMeta[] = [];
+    for (const o of objects) {
+      if ((o as EditableObject).role === "background") continue;
+      if (o instanceof fabric.Textbox) {
         const tb = o as PosterTextbox;
-        return {
+        layers.push({
           id: tb.id,
           name: tb.posterName || tb.text?.split("\n")[0]?.slice(0, 24) || "Text",
           text: tb.text ?? "",
           visible: o.visible !== false,
           locked: Boolean(tb.locked),
-        };
-      });
+          kind: "text",
+        });
+      } else if (o instanceof fabric.FabricImage) {
+        const img = o as PosterImage;
+        if (!img.id) continue;
+        layers.push({
+          id: img.id,
+          name: img.posterName || "Image",
+          text: img.posterName || "Image",
+          visible: o.visible !== false,
+          locked: Boolean(img.locked),
+          kind: "image",
+        });
+      }
+    }
     this.store().setLayers(layers);
   }
 
@@ -1032,8 +1581,33 @@ export class CanvasEngine {
       return;
     }
     const o = objs[0];
-    const props = this.readProps(o);
-    this.store().setSelected(props.id, props);
+    if (o instanceof fabric.Textbox) {
+      const props = this.readProps(o as PosterTextbox);
+      this.store().setSelected(props.id, props);
+      return;
+    }
+    if (o instanceof fabric.FabricImage) {
+      const props = this.readImageProps(o as PosterImage);
+      this.store().setSelected(props.id, props);
+      return;
+    }
+    this.store().setSelected(null, null);
+  }
+
+  private readImageProps(o: PosterImage): SelectedImageProps {
+    return {
+      id: o.id ?? "",
+      type: "image",
+      name: o.posterName || "Image",
+      opacity: round(o.opacity ?? 1, 2),
+      angle: round(o.angle ?? 0, 1),
+      left: Math.round(o.left ?? 0),
+      top: Math.round(o.top ?? 0),
+      width: Math.round((o.width ?? 0) * (o.scaleX ?? 1)),
+      height: Math.round((o.height ?? 0) * (o.scaleY ?? 1)),
+      visible: o.visible !== false,
+      locked: Boolean(o.locked),
+    };
   }
 
   private readProps(o: PosterTextbox): SelectedObjectProps {
@@ -1078,6 +1652,7 @@ export class CanvasEngine {
     this.syncLayers();
     this.syncSelected();
     this.syncBackgroundImage();
+    this.syncPosterArtwork();
   }
 
   // ----- persistence -----
@@ -1123,6 +1698,8 @@ export class CanvasEngine {
       objects: this.serializeObjects(true),
       thumbnail: this.lastThumbnail,
       hasBackgroundImage: Boolean(this.bgImage),
+      imageMode: store.imageMode,
+      detectedText: store.detectedText,
     };
     store.setSaveStatus("saving");
     void putProject(project)
@@ -1145,12 +1722,15 @@ export class CanvasEngine {
       store.setProjectId(project.id);
       store.setDoc(project.doc);
       store.setActiveProjectName(project.name);
+      store.setImageMode(project.imageMode ?? "background");
+      store.setDetectedText(project.detectedText ?? []);
       this.projectCreatedAt = project.createdAt ?? Date.now();
       this.lastThumbnail = project.thumbnail ?? null;
       this.lastThumbAt = 0;
       await this.canvas.loadFromJSON({ objects: project.objects ?? [], version: "6.0.0" });
       this.ensureIds();
       this.bgImage = this.findBackgroundImage();
+      this.imageAnalysis = null;
       if (this.bgImage) {
         this.bgImage.set({ selectable: false, evented: false, hoverCursor: "default" });
         this.addToBottom(this.bgImage);
@@ -1214,6 +1794,8 @@ export class CanvasEngine {
       this.store().setDoc(latest.doc);
       this.store().setProjectId(latest.id);
       this.store().setActiveProjectName(latest.name);
+      this.store().setImageMode(latest.imageMode ?? "background");
+      this.store().setDetectedText(latest.detectedText ?? []);
       this.projectCreatedAt = latest.createdAt ?? Date.now();
       this.lastThumbnail = latest.thumbnail ?? null;
       this.suspend += 1;

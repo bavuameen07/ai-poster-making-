@@ -1,5 +1,6 @@
 "use client";
 
+import { useRef, useState } from "react";
 import {
   AlignLeft,
   AlignCenter,
@@ -16,6 +17,8 @@ import {
   BringToFront,
   SendToBack,
   SlidersHorizontal,
+  Image as ImageIcon,
+  ImageUp,
 } from "lucide-react";
 import { Segmented } from "@/components/ui/Segmented";
 import { Slider } from "@/components/ui/Slider";
@@ -24,6 +27,7 @@ import { ColorField } from "@/components/ui/ColorField";
 import { NumberInput } from "@/components/ui/Field";
 import { IconButton } from "@/components/ui/IconButton";
 import { useEditorStore } from "@/store/editorStore";
+import type { SelectedImageProps, SelectedObjectProps } from "@/store/editorStore";
 import { getEngine } from "@/lib/editor/engineRef";
 import { FONTS, getFont, weightLabel } from "@/lib/fonts";
 import type { TextAlign } from "@/types/poster";
@@ -52,6 +56,11 @@ export function RightSidebar() {
   }
 
   const engine = getEngine();
+
+  if (selected.type === "image") {
+    return <ImageProperties selected={selected} />;
+  }
+
   const font = getFont(selected.fontFamily);
   const weights = font?.weights ?? [400, 700];
   const update = (patch: Parameters<NonNullable<typeof engine>["updateSelected"]>[0], commit: "now" | "soon" = "soon") =>
@@ -285,11 +294,165 @@ export function RightSidebar() {
   );
 }
 
+function ImageProperties({ selected }: { selected: SelectedImageProps }) {
+  const engine = getEngine();
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const update = (patch: Partial<SelectedImageProps>, commit: "now" | "soon" = "soon") =>
+    engine?.updateSelectedImage(patch, commit);
+
+  const onReplace = async (file: File | undefined) => {
+    if (!file || !engine) return;
+    setError(null);
+    setBusy(true);
+    try {
+      await engine.replaceSelectedImage(file);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not replace that image.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <aside className="flex min-h-0 w-full flex-col border-line bg-panel lg:w-[320px] lg:border-l">
+      <div className="flex h-11 shrink-0 items-center justify-between border-b border-line px-3">
+        <div className="flex items-center gap-2">
+          <ImageIcon className="h-3.5 w-3.5 text-ink-mute" />
+          <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-ink-soft">Image</span>
+        </div>
+        <div className="flex items-center gap-0.5">
+          <IconButton label="Duplicate" className="h-7 w-7" onClick={() => void engine?.duplicateSelected()}>
+            <Copy className="h-3.5 w-3.5" />
+          </IconButton>
+          <IconButton
+            label={selected.locked ? "Unlock" : "Lock"}
+            className="h-7 w-7"
+            onClick={() => update({ locked: !selected.locked }, "now")}
+          >
+            {selected.locked ? <Lock className="h-3.5 w-3.5" /> : <Unlock className="h-3.5 w-3.5" />}
+          </IconButton>
+          <IconButton
+            label={selected.visible ? "Hide" : "Show"}
+            className="h-7 w-7"
+            onClick={() => update({ visible: !selected.visible }, "now")}
+          >
+            {selected.visible ? <Eye className="h-3.5 w-3.5" /> : <EyeOff className="h-3.5 w-3.5" />}
+          </IconButton>
+          <IconButton label="Delete layer" tone="danger" className="h-7 w-7" onClick={() => engine?.deleteSelected()}>
+            <Trash2 className="h-3.5 w-3.5" />
+          </IconButton>
+        </div>
+      </div>
+
+      <div className="min-h-0 flex-1 space-y-6 overflow-y-auto scrollbar-thin p-3">
+        <Group title="Source">
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => fileRef.current?.click()}
+            className="flex h-9 w-full items-center justify-center gap-2 rounded-lg border border-line bg-panel text-xs font-medium text-ink-soft transition-colors hover:bg-paper hover:text-ink disabled:opacity-60"
+          >
+            <ImageUp className="h-3.5 w-3.5" /> {busy ? "Loading…" : "Replace image"}
+          </button>
+          <input
+            ref={fileRef}
+            type="file"
+            accept="image/png,image/jpeg,image/webp"
+            className="hidden"
+            onChange={(e) => {
+              void onReplace(e.target.files?.[0]);
+              e.target.value = "";
+            }}
+          />
+          <p className="text-[10px] leading-relaxed text-ink-faint">
+            JPG, PNG or WebP · up to 15 MB. Drag the corners on the canvas to resize.
+          </p>
+          {error && <p className="text-[11px] text-red-600">{error}</p>}
+        </Group>
+
+        <Group title="Adjust">
+          <Slider
+            label="Opacity"
+            min={0.05}
+            max={1}
+            step={0.01}
+            value={selected.opacity}
+            onChange={(v) => update({ opacity: v })}
+          />
+        </Group>
+
+        <Group title="Transform">
+          <div className="space-y-3">
+            <Slider
+              label="Rotation"
+              min={-180}
+              max={180}
+              step={1}
+              value={selected.angle}
+              suffix="°"
+              onChange={(v) => update({ angle: v })}
+            />
+            <div className="grid grid-cols-2 gap-2">
+              <label className="space-y-1">
+                <span className="field-label">X</span>
+                <NumberInput value={selected.left} onChange={(e) => update({ left: Number(e.target.value) }, "now")} />
+              </label>
+              <label className="space-y-1">
+                <span className="field-label">Y</span>
+                <NumberInput value={selected.top} onChange={(e) => update({ top: Number(e.target.value) }, "now")} />
+              </label>
+              <label className="space-y-1">
+                <span className="field-label">Width</span>
+                <NumberInput
+                  min={8}
+                  value={selected.width}
+                  onChange={(e) => update({ width: Math.max(8, Number(e.target.value)) }, "now")}
+                />
+              </label>
+              <label className="space-y-1">
+                <span className="field-label">Height</span>
+                <NumberInput
+                  min={8}
+                  value={selected.height}
+                  onChange={(e) => update({ height: Math.max(8, Number(e.target.value)) }, "now")}
+                />
+              </label>
+            </div>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => getEngine()?.moveLayer(selected.id, "top")}
+                className="flex h-8 flex-1 items-center justify-center gap-1.5 rounded-lg border border-line bg-panel text-xs text-ink-soft transition-colors hover:bg-paper hover:text-ink"
+              >
+                <BringToFront className="h-3.5 w-3.5" /> Front
+              </button>
+              <button
+                type="button"
+                onClick={() => getEngine()?.moveLayer(selected.id, "bottom")}
+                className="flex h-8 flex-1 items-center justify-center gap-1.5 rounded-lg border border-line bg-panel text-xs text-ink-soft transition-colors hover:bg-paper hover:text-ink"
+              >
+                <SendToBack className="h-3.5 w-3.5" /> Back
+              </button>
+            </div>
+          </div>
+        </Group>
+
+        <p className="px-0.5 pb-2 text-[10px] leading-relaxed text-ink-faint">
+          Hold the top handle to rotate. Use the Layers tab to reorder or hide this image.
+        </p>
+      </div>
+    </aside>
+  );
+}
+
 function ShadowControls({
   selected,
   update,
 }: {
-  selected: NonNullable<ReturnType<typeof useEditorStore.getState>["selected"]>;
+  selected: SelectedObjectProps;
   update: (patch: Record<string, unknown>, commit?: "now" | "soon") => void;
 }) {
   const shadow = selected.shadow;

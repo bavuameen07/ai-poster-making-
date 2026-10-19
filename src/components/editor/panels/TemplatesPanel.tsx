@@ -16,10 +16,10 @@ export function TemplatesPanel() {
             key={template.id}
             type="button"
             onClick={() => getEngine()?.applyTemplate(template)}
-            className="group text-left"
+            className="group min-w-0 text-left focus-visible:outline-none"
           >
-            <div className="flex justify-center overflow-hidden rounded-lg border border-line bg-paper p-2 transition-all duration-200 ease-smooth group-hover:border-accent/40 group-hover:shadow-panel">
-              <PosterThumb template={template} width={120} />
+            <div className="overflow-hidden rounded-lg border border-line bg-paper p-2 transition-all duration-200 ease-smooth group-hover:border-accent/40 group-hover:shadow-panel group-focus-visible:border-accent group-focus-visible:ring-2 group-focus-visible:ring-accent/30">
+              <PosterThumb template={template} width={120} height={150} />
             </div>
             <p className="mt-1.5 truncate text-[11px] font-medium text-ink-soft group-hover:text-ink">
               {template.name}

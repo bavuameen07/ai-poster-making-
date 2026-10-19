@@ -1,5 +1,6 @@
 "use client";
 
+import { useRef, useState } from "react";
 import type { LucideIcon } from "lucide-react";
 import {
   Heading1,
@@ -9,10 +10,15 @@ import {
   Tag,
   Hash,
   MousePointerClick,
+  ImageUp,
+  Loader2,
 } from "lucide-react";
 import { useEditorStore } from "@/store/editorStore";
 import { getEngine } from "@/lib/editor/engineRef";
 import { idealTextColor } from "@/lib/background";
+import { cn } from "@/lib/utils";
+import { Segmented } from "@/components/ui/Segmented";
+import { Slider } from "@/components/ui/Slider";
 import type { TextPreset } from "@/lib/editor/CanvasEngine";
 
 interface Preset {
@@ -127,27 +133,119 @@ const PRESETS: Preset[] = [
 export function AddTextPanel() {
   const background = useEditorStore((s) => s.doc.background);
   const color = idealTextColor(background);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [dragging, setDragging] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const imageMode = useEditorStore((s) => s.imageMode);
+  const posterArt = useEditorStore((s) => s.posterArt);
+
+  const addImage = async (file: File | undefined) => {
+    if (!file) return;
+    setError(null);
+    setBusy(true);
+    try {
+      if (imageMode === "poster") await getEngine()?.addPosterImageFromFile(file);
+      else await getEngine()?.setBackgroundImage(file);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not add that image.");
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
-    <div className="space-y-2">
-      <p className="px-0.5 text-xs leading-relaxed text-ink-mute">
-        Add a text layer, then edit it directly on the canvas.
-      </p>
-      <div className="grid grid-cols-2 gap-2">
-        {PRESETS.map((preset) => (
+    <div className="space-y-4">
+      <div className="space-y-2">
+        <span className="field-label">Image</span>
+        <Segmented
+          className="w-full [&>button]:flex-1"
+          value={imageMode}
+          onChange={(value) => getEngine()?.switchImageMode(value as "poster" | "background")}
+          options={[
+            { value: "poster", label: "Poster Image Mode" },
+            { value: "background", label: "Background Image Mode" },
+          ]}
+        />
+        <div
+          onDragOver={(e) => {
+            e.preventDefault();
+            setDragging(true);
+          }}
+          onDragLeave={() => setDragging(false)}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDragging(false);
+            void addImage(e.dataTransfer.files?.[0]);
+          }}
+          className={cn(
+            "flex flex-col items-center gap-2 rounded-lg border border-dashed px-3 py-5 text-center transition-colors",
+            dragging ? "border-accent bg-accent-wash" : "border-line bg-paper",
+          )}
+        >
+          <span className="flex h-9 w-9 items-center justify-center rounded-lg border border-line bg-panel text-ink-mute">
+            {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <ImageUp className="h-4 w-4" />}
+          </span>
+          <p className="text-[11px] leading-relaxed text-ink-mute">
+            {imageMode === "poster" ? "Upload a poster to preserve it as editable artwork." : "Upload a photo to use behind your text."}
+            <br /> upload from your device.
+          </p>
           <button
-            key={preset.id}
             type="button"
-            onClick={() => getEngine()?.addTextObject(preset.build(color))}
-            className="flex items-center gap-2.5 rounded-lg border border-line bg-panel px-2.5 py-2 text-left transition-all duration-150 ease-smooth hover:border-accent/40 hover:bg-paper"
+            disabled={busy}
+            onClick={() => fileRef.current?.click()}
+            className="rounded-lg border border-line bg-panel px-3 py-1.5 text-xs font-medium text-ink-soft transition-colors hover:bg-paper hover:text-ink disabled:opacity-60"
           >
-            <preset.icon className="h-4 w-4 shrink-0 text-ink-mute" />
-            <span className="min-w-0">
-              <span className="block truncate text-[13px] font-medium text-ink">{preset.label}</span>
-              <span className="block truncate text-[10px] text-ink-faint">{preset.hint}</span>
-            </span>
+            {busy ? "Loading…" : "Upload image"}
           </button>
-        ))}
+          <input
+            ref={fileRef}
+            type="file"
+            accept="image/png,image/jpeg,image/webp"
+            className="hidden"
+            onChange={(e) => {
+              void addImage(e.target.files?.[0]);
+              e.target.value = "";
+            }}
+          />
+          <span className="text-[10px] text-ink-faint">JPG, PNG or WebP · up to 15 MB</span>
+        </div>
+        {error && <p className="text-[11px] text-red-600">{error}</p>}
+        {imageMode === "poster" && posterArt?.present && (
+          <div className="space-y-2 rounded-lg border border-line bg-panel p-2.5">
+            <p className="truncate text-xs font-medium text-ink">Main artwork · {posterArt.name}</p>
+            <Segmented size="sm" className="w-full [&>button]:flex-1" value={posterArt.fit}
+              onChange={(value) => getEngine()?.setPosterImageFit(value as "contain" | "cover" | "custom")}
+              options={[{ value: "contain", label: "Fit" }, { value: "cover", label: "Fill" }, { value: "custom", label: "Crop" }]} />
+            <Slider label="Zoom" min={0.2} max={4} step={0.01} value={posterArt.zoom} suffix="×" onChange={(v) => getEngine()?.setPosterImageZoom(v)} />
+            <Slider label="Horizontal position" min={-60} max={60} step={1} value={posterArt.offsetX} suffix="%" onChange={(v) => getEngine()?.setPosterImageOffset(v, posterArt.offsetY)} />
+            <Slider label="Vertical position" min={-60} max={60} step={1} value={posterArt.offsetY} suffix="%" onChange={(v) => getEngine()?.setPosterImageOffset(posterArt.offsetX, v)} />
+            <p className="text-[10px] leading-relaxed text-ink-mute">The source artwork remains intact. Covering text adds a reversible overlay.</p>
+          </div>
+        )}
+      </div>
+
+      <div className="space-y-2">
+        <span className="field-label">Text</span>
+        <p className="px-0.5 text-xs leading-relaxed text-ink-mute">
+          Add a text layer, then edit it directly on the canvas.
+        </p>
+        <div className="grid grid-cols-2 gap-2">
+          {PRESETS.map((preset) => (
+            <button
+              key={preset.id}
+              type="button"
+              onClick={() => getEngine()?.addTextObject(preset.build(color))}
+              className="flex items-center gap-2.5 rounded-lg border border-line bg-panel px-2.5 py-2 text-left transition-all duration-150 ease-smooth hover:border-accent/40 hover:bg-paper"
+            >
+              <preset.icon className="h-4 w-4 shrink-0 text-ink-mute" />
+              <span className="min-w-0">
+                <span className="block truncate text-[13px] font-medium text-ink">{preset.label}</span>
+                <span className="block truncate text-[10px] text-ink-faint">{preset.hint}</span>
+              </span>
+            </button>
+          ))}
+        </div>
       </div>
 
       <div className="flex items-start gap-2 rounded-lg border border-line bg-paper px-2.5 py-2 text-[11px] text-ink-mute">

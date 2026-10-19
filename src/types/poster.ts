@@ -53,6 +53,18 @@ export interface LayerMeta {
   text: string;
   visible: boolean;
   locked: boolean;
+  kind: "text" | "image";
+}
+
+export interface DetectedTextRegion {
+  id: string;
+  text: string;
+  confidence: number;
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  covered?: boolean;
 }
 
 export interface CanvasSize {
@@ -108,4 +120,6 @@ export interface StoredProject {
   objects: unknown[];
   thumbnail?: string | null;
   hasBackgroundImage?: boolean;
+  imageMode?: "poster" | "background";
+  detectedText?: DetectedTextRegion[];
 }

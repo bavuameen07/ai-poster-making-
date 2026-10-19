@@ -1,6 +1,6 @@
 "use client";
 
-import { LayoutTemplate, Type, Wand2, PaintBucket, Layers, FolderOpen } from "lucide-react";
+import { LayoutTemplate, PlusSquare, Wand2, PaintBucket, Layers, FolderOpen } from "lucide-react";
 import { useEditorStore } from "@/store/editorStore";
 import type { LeftTab } from "@/store/editorStore";
 import { cn } from "@/lib/utils";
@@ -13,7 +13,7 @@ import { ProjectsPanel } from "./panels/ProjectsPanel";
 
 const TABS: { id: LeftTab; label: string; icon: React.ReactNode }[] = [
   { id: "templates", label: "Templates", icon: <LayoutTemplate className="h-4 w-4" /> },
-  { id: "text", label: "Text", icon: <Type className="h-4 w-4" /> },
+  { id: "text", label: "Add", icon: <PlusSquare className="h-4 w-4" /> },
   { id: "ai", label: "AI", icon: <Wand2 className="h-4 w-4" /> },
   { id: "background", label: "Canvas", icon: <PaintBucket className="h-4 w-4" /> },
   { id: "layers", label: "Layers", icon: <Layers className="h-4 w-4" /> },

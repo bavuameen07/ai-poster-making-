@@ -66,13 +66,13 @@ export function CanvasStage({ initialTemplateId }: CanvasStageProps) {
   const displayHeight = Math.round(doc.height * zoom);
 
   return (
-    <div className="relative flex min-h-0 flex-1 flex-col">
+    <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
       <div
         ref={viewportRef}
-        className="relative flex-1 overflow-auto scrollbar-thin"
+        className="relative min-h-0 min-w-0 flex-1 overflow-auto scrollbar-thin"
         style={{ background: "#EDEDEA" }}
       >
-        <div className="flex min-h-full w-max min-w-full items-center justify-center p-10">
+        <div className="grid min-h-full w-max min-w-full place-items-center p-10">
           <div
             ref={frameRef}
             className="poster-frame relative"
